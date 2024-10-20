@@ -9,6 +9,6 @@ __pycache__/
 .vscode/
 
 irrelavance/
-data/
+data
 sam_hq/
 biomed_clip/
