@@ -1,3 +1,6 @@
+# masks loss based on points sampling and their uncertainty.
+# basically adapted from https://github.com/SysCV/sam-hq.git
+
 import torch
 from torch.nn import functional as F
 from typing import List, Optional

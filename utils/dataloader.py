@@ -1,7 +1,3 @@
-# Copyright by HQ-SAM team
-# All rights reserved.
-
-## data loader
 from __future__ import print_function, division
 
 import numpy as np
@@ -9,6 +5,7 @@ import random
 from copy import deepcopy
 from skimage import io
 import cv2
+from PIL import Image
 import os
 from glob import glob
 
@@ -19,40 +16,38 @@ from torchvision.transforms.functional import normalize
 import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
 
-#### --------------------- dataloader online ---------------------####
-
-def get_im_gt_name_dict(datasets, flag='valid'):
-    print("------------------------------", flag, "--------------------------------")
-    name_im_gt_list = []
-
-    for i in range(len(datasets)):
-        print("--->>>", flag, " dataset ",i,"/",len(datasets)," ",datasets[i]["name"],"<<<---")
-        tmp_im_list, tmp_gt_list = [], []
-        tmp_im_list = glob(datasets[i]["im_dir"]+os.sep+'*'+datasets[i]["im_ext"])
-        print('-im-',datasets[i]["name"],datasets[i]["im_dir"], ': ',len(tmp_im_list))
-
-        if(datasets[i]["gt_dir"]==""):
-            print('-gt-', datasets[i]["name"], datasets[i]["gt_dir"], ': ', 'No Ground Truth Found')
-            tmp_gt_list = []
-        else:
-            tmp_gt_list = [datasets[i]["gt_dir"]+os.sep+x.split(os.sep)[-1].split(datasets[i]["im_ext"])[0]+datasets[i]["gt_ext"] for x in tmp_im_list]
-            print('-gt-', datasets[i]["name"],datasets[i]["gt_dir"], ': ',len(tmp_gt_list))
-
-
-        name_im_gt_list.append({"dataset_name":datasets[i]["name"],
-                                "im_path":tmp_im_list,
+def get_data_dict(annotations, shuffle=False):
+    print("------------------------------Collecting Datasets--------------------------------")
+    data_dict = []
+    for i, annotation in enumerate(annotations):
+        with open(annotation, 'r') as f:
+            dataset_name = f.readline().strip()
+            print("--->>>", " Dataset[",i,"] ", dataset_name," <<<---")
+            for line in f.readlines():
+                tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
+                tmp_im_list.append(line.split(' | ')[0])
+                tmp_gt_list.append(line.split(' | ')[1])
+                tmp_caption_list.append(line.split(' ')[2].strip())
+            if shuffle:
+                combined = list(zip(tmp_im_list, tmp_gt_list, tmp_caption_list))
+                random.shuffle(combined)
+                shuffled1, shuffled2, shuffled3 = zip(*combined)
+                tmp_im_list = list(shuffled1)
+                tmp_gt_list = list(shuffled2)
+                tmp_caption_list = list(shuffled3)
+            data_dict.append({"dataset_name": dataset_name,
+                                "img_path":tmp_im_list,
                                 "gt_path":tmp_gt_list,
-                                "im_ext":datasets[i]["im_ext"],
-                                "gt_ext":datasets[i]["gt_ext"]})
+                                "caption":tmp_caption_list})
 
-    return name_im_gt_list
+    return data_dict
 
-def create_dataloaders(name_im_gt_list, my_transforms=[], batch_size=1, training=False):
-    gos_dataloaders = []
-    gos_datasets = []
+def create_dataloaders(data_dict, my_transforms=[], batch_size=1, training=False):
+    my_dataloaders = []
+    my_datasets = []
 
-    if(len(name_im_gt_list)==0):
-        return gos_dataloaders, gos_datasets
+    if(len(data_dict)==0):
+        return my_dataloaders, my_datasets
 
     num_workers_ = 1
     if(batch_size>1):
@@ -64,29 +59,29 @@ def create_dataloaders(name_im_gt_list, my_transforms=[], batch_size=1, training
 
 
     if training:
-        for i in range(len(name_im_gt_list)):   
-            gos_dataset = OnlineDataset([name_im_gt_list[i]], transform = transforms.Compose(my_transforms))
-            gos_datasets.append(gos_dataset)
+        for i in range(len(data_dict)):   
+            my_dataset = MyDataset([data_dict[i]], transform = transforms.Compose(my_transforms))
+            my_datasets.append(my_dataset)
 
-        gos_dataset = ConcatDataset(gos_datasets)
-        sampler = DistributedSampler(gos_dataset)
+        my_dataset = ConcatDataset(my_datasets)
+        sampler = DistributedSampler(my_dataset)
         batch_sampler_train = torch.utils.data.BatchSampler(
             sampler, batch_size, drop_last=True)
-        dataloader = DataLoader(gos_dataset, batch_sampler=batch_sampler_train, num_workers=num_workers_)
+        dataloader = DataLoader(my_dataset, batch_sampler=batch_sampler_train, num_workers=num_workers_)
 
-        gos_dataloaders = dataloader
-        gos_datasets = gos_dataset
+        my_dataloaders = dataloader
+        my_datasets = my_dataset
 
     else:
-        for i in range(len(name_im_gt_list)):   
-            gos_dataset = OnlineDataset([name_im_gt_list[i]], transform = transforms.Compose(my_transforms), eval_ori_resolution = True)
-            sampler = DistributedSampler(gos_dataset, shuffle=False)
-            dataloader = DataLoader(gos_dataset, batch_size, sampler=sampler, drop_last=False, num_workers=num_workers_)
+        for i in range(len(data_dict)):   
+            my_dataset = MyDataset([data_dict[i]], transform = transforms.Compose(my_transforms), eval_ori_resolution = True)
+            sampler = DistributedSampler(my_dataset, shuffle=False)
+            dataloader = DataLoader(my_dataset, batch_size, sampler=sampler, drop_last=False, num_workers=num_workers_)
 
-            gos_dataloaders.append(dataloader)
-            gos_datasets.append(gos_dataset)
+            my_dataloaders.append(dataloader)
+            my_datasets.append(my_dataset)
 
-    return gos_dataloaders, gos_datasets
+    return my_dataloaders, my_datasets
 
 class RandomHFlip(object):
     def __init__(self,prob=0.5):
@@ -202,47 +197,39 @@ class LargeScaleJitter(object):
 
 
 
-class OnlineDataset(Dataset):
-    def __init__(self, name_im_gt_list, transform=None, eval_ori_resolution=False):
+class MyDataset(Dataset):
+    def __init__(self, data_dict, transform=None):
 
         self.transform = transform
         self.dataset = {}
         ## combine different datasets into one
         dataset_names = []
         dt_name_list = [] # dataset name per image
-        im_name_list = [] # image name
-        im_path_list = [] # im path
+        img_path_list = [] # im path
         gt_path_list = [] # gt path
-        im_ext_list = [] # im ext
-        gt_ext_list = [] # gt ext
-        for i in range(0,len(name_im_gt_list)):
-            dataset_names.append(name_im_gt_list[i]["dataset_name"])
-            # dataset name repeated based on the number of images in this dataset
-            dt_name_list.extend([name_im_gt_list[i]["dataset_name"] for x in name_im_gt_list[i]["im_path"]])
-            im_name_list.extend([x.split(os.sep)[-1].split(name_im_gt_list[i]["im_ext"])[0] for x in name_im_gt_list[i]["im_path"]])
-            im_path_list.extend(name_im_gt_list[i]["im_path"])
-            gt_path_list.extend(name_im_gt_list[i]["gt_path"])
-            im_ext_list.extend([name_im_gt_list[i]["im_ext"] for x in name_im_gt_list[i]["im_path"]])
-            gt_ext_list.extend([name_im_gt_list[i]["gt_ext"] for x in name_im_gt_list[i]["gt_path"]])
+        caption_list = []
+        for i in range(0,len(data_dict)):
+            dataset_names.append(data_dict[i]["dataset_name"])
+            dt_name_list.extend([data_dict[i]["dataset_name"] for x in data_dict[i]["img_path"]])
+            img_path_list.extend(data_dict[i]["img_path"])
+            gt_path_list.extend(data_dict[i]["gt_path"])
+            caption_list.extend(data_dict[i]["caption"])
 
 
         self.dataset["data_name"] = dt_name_list
-        self.dataset["im_name"] = im_name_list
-        self.dataset["im_path"] = im_path_list
-        self.dataset["ori_im_path"] = deepcopy(im_path_list)
+        self.dataset["img_path"] = img_path_list
+        self.dataset["ori_img_path"] = deepcopy(img_path_list)
         self.dataset["gt_path"] = gt_path_list
         self.dataset["ori_gt_path"] = deepcopy(gt_path_list)
-        self.dataset["im_ext"] = im_ext_list
-        self.dataset["gt_ext"] = gt_ext_list
-
-        self.eval_ori_resolution = eval_ori_resolution
 
     def __len__(self):
-        return len(self.dataset["im_path"])
+        return len(self.dataset["img_path"])
+    
     def __getitem__(self, idx):
-        im_path = self.dataset["im_path"][idx]
+        img_path = self.dataset["img_path"][idx]
         gt_path = self.dataset["gt_path"][idx]
-        im = cv2.imread(im_path)
+        caption = self.dataset["caption"][idx]
+        im = cv2.imread(img_path)
         gt = cv2.imread(gt_path)
 
         if len(gt.shape) > 2:
@@ -258,18 +245,25 @@ class OnlineDataset(Dataset):
         assert torch.max(gt) != 0, f"{gt_path} \n"
         
         sample = {
-        "imidx": torch.from_numpy(np.array(idx)),
-        "image": im,
-        "label": gt,
-        "shape": torch.tensor(im.shape[-2:]),
+            "imidx": torch.from_numpy(np.array(idx)),
+            "image": im,
+            "label": gt,
+            "caption": caption,
+            "shape": torch.tensor(im.shape[-2:]),
         }
         
         if self.transform:
             sample = self.transform(sample)
+            
+        image_tensor = torch.transpose(sample["image"], 0, 2).transpose(0, 1)
+    
+        image_tensor = image_tensor * 255 
+        image_tensor = image_tensor.byte()   
+        pil_image = Image.fromarray(image_tensor.numpy())
 
-        if self.eval_ori_resolution:
-            sample["ori_label"] = gt.type(torch.uint8)  # NOTE for evaluation only. And no flip here
-            sample['ori_im_path'] = self.dataset["im_path"][idx]
-            sample['ori_gt_path'] = self.dataset["gt_path"][idx]
+        sample["pil_image"] = pil_image
+        sample["ori_label"] = gt.type(torch.uint8)  
+        sample['ori_img_path'] = self.dataset["img_path"][idx]
+        sample['ori_gt_path'] = self.dataset["gt_path"][idx]
 
         return sample
