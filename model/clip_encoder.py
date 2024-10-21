@@ -94,15 +94,15 @@ class ClipHead(nn.Module):
         return img_out, text_out, pe.expand(img_out.shape)
         
 
-class ClipInference:
+class ClipEncoder(nn.Module):
     def __init__(
         self,
         embedding_dim: int = 512,
         out_dim: int = 256,
         clip_model: str = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
         tokenizer: str = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
-        device: str = None,
-        learnable_pe: bool = True
+        learnable_pe: bool = True,
+        num_text_embeddings: int = 1
     ):
         """
         Biomed-clip inference model to generate clip features for image patches and caption. Using linear head 
@@ -113,13 +113,15 @@ class ClipInference:
           out_dim : the channel dimension of the ImageEncoder output features
           clip_model : the huggingface repo of the biomed-clip
           tokenizer : the tokenizer used by biomed-clip
-          device : the device to put the clip model and data on
           learnable_pe : whether to use a learnable position embedding for patch features
+          num_text_embedding : number of text embeddings from clip model
         """
-        if device is not None:
-            self.device = device       
-        else:
-            self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+        super.__init__()
+        
+        # if device is not None:
+        #     self.device = device       
+        # else:
+        #     self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
             
         self.model, self.preprocess = create_model_from_pretrained(clip_model)
         self.tokenizer = get_tokenizer(tokenizer)
@@ -128,9 +130,9 @@ class ClipInference:
             mlp_dim=out_dim,
             out_dim=out_dim,
             learnable_pe=learnable_pe,
-        ).to(self.device)
-        self.model.to(self.device)
+        )
         self.model.eval()
+        self.num_text_embeddings = num_text_embeddings
         
         
     def get_patches(self, image:Image, n_patches):  
@@ -159,14 +161,13 @@ class ClipInference:
         return resized_image
 
     
-    def __call__(
+    def forward(
         self, 
         batch_images: list,
         batch_captions: list,
         n_patches: int = 4,
         target_size: Tuple = (1024, 1024),
         context_length: int = 256,
-        num_text_embedding: int = 1
         ):
         assert len(batch_captions) == len(batch_images)
         bs = len(batch_images)
@@ -182,7 +183,7 @@ class ClipInference:
             image_embedding, text_embedding, _ = self.model(image_tensor, text_tensor)
         image_embedding.view(bs, n_patches*n_patches+1, -1)
         text_embedding.view(bs, n_patches*n_patches+1, -1)
-        img_out, text_out, pe = self.head(n_patches, image_embedding, text_embedding[:, :num_text_embedding, :])
+        img_out, text_out, pe = self.head(n_patches, image_embedding, text_embedding[:, :self.num_text_embeddings, :])
         return img_out, text_out, pe
 
         

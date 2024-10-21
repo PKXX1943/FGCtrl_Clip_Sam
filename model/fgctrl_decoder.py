@@ -13,10 +13,9 @@ from segment_anything.modeling.prompt_encoder import PositionEmbeddingRandom
 class FGCtrlDecoder(nn.Module):
     def __init__(
         self, 
-        fgctrl_config: list[dict],
+        fgctrl_config: dict[list],
         input_dim: int,
         output_dim: int,
-        n_patches: int,
         num_multimask_outputs: int = 3,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
@@ -27,11 +26,12 @@ class FGCtrlDecoder(nn.Module):
         and their position embeddings, and a text embedding. 
         
         Args:
-          fgctrl_config: a list of configuration dictionary for building decoder blocks. keys referrence below:
-                input_dim (int) : the channel dimension of the input embeddings of current block
-                output_dim (int) : the channel dimension of the output embeddings of current block
-                transformer_depth (int) : the number of transformer blocks in the transformer structure of current block
-                downsample_rate (int): downsample when doing qkv projection in attention blocks
+          fgctrl_config: a dictionary of configurations for building decoder blocks. keys referrence below:
+                n_patches (int) : the number of patches an image is split on each side
+                input_dim (list[int]) : the channel dimension of the input embeddings of each block
+                output_dim (list[int]) : the channel dimension of the output embeddings of each block
+                transformer_depth (list[int]) : the number of transformer blocks in the transformer structure of each block
+                downsample_rate (list[int]): downsample when doing qkv projection in attention blocks
           input_dim : the channel dimension of the input embeddings of FGCtrlDecoder
           out_dim : the channel dimension of the final embeddings of of FGCtrlDecoder
           n_patches : to split an image into n * n patches for fine-grained control
@@ -40,14 +40,16 @@ class FGCtrlDecoder(nn.Module):
           iou_head_hidden_dim : the hidden dimension of the MLP used to predict mask quality
         """
         self.blocks = nn.ModuleList([])
-        for idx, block_config in enumerate(fgctrl_config):
+        num_blocks = len(fgctrl_config["input_dim"])
+        self.n_patches = fgctrl_config['n_patches']
+        for idx in range(num_blocks):
             self.blocks.append(
                 FGCtrlBlock(
-                    n_patches=n_patches,
-                    input_dim=block_config['input_dim'],
-                    output_dim=block_config['output_dim'],
-                    transformer_depth=block_config['transformer_depth'],
-                    downsample_rate=block_config['dowsample_rate']
+                    n_patches=self.n_patches,
+                    input_dim=fgctrl_config['input_dim'][idx],
+                    output_dim=fgctrl_config['output_dim'][idx],
+                    transformer_depth=fgctrl_config['transformer_depth'][idx],
+                    downsample_rate=fgctrl_config['dowsample_rate'][idx]
                 )
             )
         self.pe_layer = PositionEmbeddingRandom(input_dim//2)
@@ -64,7 +66,6 @@ class FGCtrlDecoder(nn.Module):
     def forward(
         self,
         image_embedding: Tensor,
-        image_pe: Tensor,
         clip_embedding: Tensor,
         clip_pe: Tensor,
         text_embedding: Tensor,

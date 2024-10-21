@@ -96,7 +96,8 @@ class Sam(nn.Module):
         """
         input_images = torch.stack([self.preprocess(x["image"]) for x in batched_input], dim=0)
         
-        image_embeddings, interm_embeddings = self.image_encoder(input_images)
+        # image_embeddings, interm_embeddings = self.image_encoder(input_images)
+        image_embeddings = self.image_encoder(input_images)
 
         outputs = []
         for image_record, curr_embedding in zip(batched_input, image_embeddings):
@@ -136,7 +137,8 @@ class Sam(nn.Module):
                 }
             )
 
-        return outputs, interm_embeddings
+        # return outputs, interm_embeddings
+        return outputs
 
     def postprocess_masks(
         self,
