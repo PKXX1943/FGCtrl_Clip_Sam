@@ -21,6 +21,10 @@ class PositionEmbeddingRandom(nn.Module):
         else:
             self.scale = scale
         self.positional_encoding_matrix = nn.Parameter(torch.randn(2, num_pos_feats), requires_grad=learnable_pe)
+        
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def _pe_encoding(self, coords: torch.Tensor) -> torch.Tensor:
         """Positionally encode points that are normalized to [0,1]."""
@@ -35,8 +39,8 @@ class PositionEmbeddingRandom(nn.Module):
         """Generate positional encoding for an n x n grid of patches."""
         # Create normalized coordinates for each patch in an n x n grid
         coords = torch.stack(torch.meshgrid(
-            torch.arange(n_patches, dtype=torch.float32),  # rows
-            torch.arange(n_patches, dtype=torch.float32)   # columns
+            torch.arange(n_patches, dtype=torch.float32, device=self.device),  # rows
+            torch.arange(n_patches, dtype=torch.float32, device=self.device)   # columns
         ), dim=-1)  # shape: n x n x 2 (i, j)
 
         # Normalize coordinates to [0,1] by dividing by n (patch coordinates are (i/n, j/n))
@@ -58,7 +62,7 @@ class ClipHead(nn.Module):
         act: Type[nn.Module] = nn.GELU,
     ) -> None:
         super().__init__()
-        self.pos_embed = PositionEmbeddingRandom(embedding_dim//2,)
+        self.pos_embed = PositionEmbeddingRandom(out_dim//2,)
         self.lin1_img = nn.Linear(embedding_dim, mlp_dim)
         self.lin2_img = nn.Linear(mlp_dim, out_dim)
         self.lin1_text = nn.Linear(embedding_dim, mlp_dim)
@@ -91,7 +95,7 @@ class ClipHead(nn.Module):
         img_out = self.norm(self.lin2_img(self.act(self.lin1_img(image_embedding))))
         text_out = self.norm(self.lin2_text(self.act(self.lin1_text(text_embedding))))
         
-        return img_out, text_out, pe.expand(img_out.shape)
+        return img_out, text_out, pe.unsqueeze(0).expand(img_out.size(0), -1, -1)
         
 
 class ClipEncoder(nn.Module):
@@ -116,13 +120,8 @@ class ClipEncoder(nn.Module):
           learnable_pe : whether to use a learnable position embedding for patch features
           num_text_embedding : number of text embeddings from clip model
         """
-        super.__init__()
+        super().__init__()
         
-        # if device is not None:
-        #     self.device = device       
-        # else:
-        #     self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-            
         self.model, self.preprocess = create_model_from_pretrained(clip_model)
         self.tokenizer = get_tokenizer(tokenizer)
         self.head = ClipHead(
@@ -134,6 +133,10 @@ class ClipEncoder(nn.Module):
         self.model.eval()
         self.num_text_embeddings = num_text_embeddings
         
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
         
     def get_patches(self, image:Image, n_patches):  
         # split an image into patches   
@@ -148,7 +151,7 @@ class ClipEncoder(nn.Module):
                 blocks.append(block)
         return blocks
     
-    def resize_image(image, target_size=(1024, 1024)):
+    def resize_image(self, image, target_size=(1024, 1024)):
         # resize method that is consistent with dataset transforms
         transform_to_tensor = T.ToTensor()  
         image_tensor = transform_to_tensor(image).unsqueeze(0)  
@@ -181,8 +184,8 @@ class ClipEncoder(nn.Module):
         text_tensor = self.tokenizer(captions, context_length=context_length).to(self.device)
         with torch.no_grad():
             image_embedding, text_embedding, _ = self.model(image_tensor, text_tensor)
-        image_embedding.view(bs, n_patches*n_patches+1, -1)
-        text_embedding.view(bs, n_patches*n_patches+1, -1)
+        image_embedding = image_embedding.view(bs, n_patches*n_patches+1, -1)
+        text_embedding = text_embedding.view(bs, n_patches*n_patches+1, -1)
         img_out, text_out, pe = self.head(n_patches, image_embedding, text_embedding[:, :self.num_text_embeddings, :])
         return img_out, text_out, pe
 

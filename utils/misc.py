@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch import Tensor
-
+import logging
 import colorsys
 import torch.nn.functional as F
 
@@ -200,7 +200,7 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
-    def log_every(self, iterable, print_freq, header=None, logger=None):
+    def log_every(self, iterable, print_freq, header=None, logger=None, is_main_proc = True):
         if logger is None:
             print_func = print
         else:
@@ -214,25 +214,26 @@ class MetricLogger(object):
         iter_time = SmoothedValue(fmt='{avg:.4f}')
         data_time = SmoothedValue(fmt='{avg:.4f}')
         space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
-        if torch.cuda.is_available():
-            log_msg = self.delimiter.join([
-                header,
-                '[{0' + space_fmt + '}/{1}]',
-                'eta: {eta}',
-                '{meters}',
-                'time: {time}',
-                'data: {data}',
-                'max mem: {memory:.0f}'
-            ])
-        else:
-            log_msg = self.delimiter.join([
-                header,
-                '[{0' + space_fmt + '}/{1}]',
-                'eta: {eta}',
-                '{meters}',
-                'time: {time}',
-                'data: {data}'
-            ])
+        if is_main_proc:
+            if torch.cuda.is_available():
+                log_msg = self.delimiter.join([
+                    header,
+                    '[{0' + space_fmt + '}/{1}]',
+                    'eta: {eta}',
+                    '{meters}',
+                    'time: {time}',
+                    'data: {data}',
+                    'max mem: {memory:.0f}'
+                ])
+            else:
+                log_msg = self.delimiter.join([
+                    header,
+                    '[{0' + space_fmt + '}/{1}]',
+                    'eta: {eta}',
+                    '{meters}',
+                    'time: {time}',
+                    'data: {data}'
+                ])
         MB = 1024.0 * 1024.0
         for obj in iterable:
             data_time.update(time.time() - end)
@@ -242,24 +243,44 @@ class MetricLogger(object):
             if i % print_freq == 0 or i == len(iterable) - 1:
                 eta_seconds = iter_time.global_avg * (len(iterable) - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                if torch.cuda.is_available():
-                    print_func(log_msg.format(
-                        i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time),
-                        memory=torch.cuda.max_memory_allocated() / MB))
-                else:
-                    print_func(log_msg.format(
-                        i, len(iterable), eta=eta_string,
-                        meters=str(self),
-                        time=str(iter_time), data=str(data_time)))
+                if is_main_proc:
+                    if torch.cuda.is_available():
+                        print_func(log_msg.format(
+                            i, len(iterable), eta=eta_string,
+                            meters=str(self),
+                            time=str(iter_time), data=str(data_time),
+                            memory=torch.cuda.max_memory_allocated() / MB))
+                    else:
+                        print_func(log_msg.format(
+                            i, len(iterable), eta=eta_string,
+                            meters=str(self),
+                            time=str(iter_time), data=str(data_time)))
             i += 1
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print_func('{} Total time: {} ({:.4f} s / it)'.format(
+        if is_main_proc:
+            print_func('{} Total time: {} ({:.4f} s / it)'.format(
             header, total_time_str, total_time / len(iterable)))
 
+def setup_logger(log_file=None, level=logging.INFO):
+    logger = logging.getLogger()
+    logger.setLevel(level)
+
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    if log_file is not None:            
+        if is_main_process() and not os.path.exists(os.path.dirname(log_file)):
+            os.makedirs(os.path.dirname(log_file))
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
 
 def get_sha():
     cwd = os.path.dirname(os.path.abspath(__file__))
@@ -505,49 +526,66 @@ def mask_iou(pred_label,label):
         return -1
     return intersection / union
 
+def mask_dice(pred_label, label, smooth=1e-6):
+    '''
+    Calculate mask Dice coefficient for pred_label and gt_label
+    '''
 
+    pred_label = (pred_label > 0)[0].int()
+    label = (label > 128)[0].int()
 
-# General util function to get the boundary of a binary mask.
-# https://gist.github.com/bowenc0221/71f7a02afee92646ca05efeeb14d687d
-def mask_to_boundary(mask, dilation_ratio=0.02):
-    """
-    Convert binary mask to boundary mask.
-    :param mask (numpy array, uint8): binary mask
-    :param dilation_ratio (float): ratio to calculate dilation = dilation_ratio * image_diagonal
-    :return: boundary mask (numpy array)
-    """
-    h, w = mask.shape
-    img_diag = np.sqrt(h ** 2 + w ** 2)
-    dilation = int(round(dilation_ratio * img_diag))
-    if dilation < 1:
-        dilation = 1
-    # Pad image so mask truncated by the image border is also considered as boundary.
-    new_mask = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
-    kernel = np.ones((3, 3), dtype=np.uint8)
-    new_mask_erode = cv2.erode(new_mask, kernel, iterations=dilation)
-    mask_erode = new_mask_erode[1 : h + 1, 1 : w + 1]
-    # G_d intersects G in the paper.
-    return mask - mask_erode
+    intersection = (label * pred_label).sum()
+    pred_sum = pred_label.sum()
+    label_sum = label.sum()
 
-
-def boundary_iou(gt, dt, dilation_ratio=0.02):
-    """
-    Compute boundary iou between two binary masks.
-    :param gt (numpy array, uint8): binary mask
-    :param dt (numpy array, uint8): binary mask
-    :param dilation_ratio (float): ratio to calculate dilation = dilation_ratio * image_diagonal
-    :return: boundary iou (float)
-    """
-    device = gt.device
-    dt = (dt>0)[0].cpu().byte().numpy()
-    gt = (gt>128)[0].cpu().byte().numpy()
-
-    gt_boundary = mask_to_boundary(gt, dilation_ratio)
-    dt_boundary = mask_to_boundary(dt, dilation_ratio)
-    intersection = ((gt_boundary * dt_boundary) > 0).sum()
-    union = ((gt_boundary + dt_boundary) > 0).sum()
-    if union == 0:
-        print("Error: boundary_iou -> union == 0")
+    if pred_sum + label_sum == 0:
+        print("Error: mask_dice -> pred_sum + label_sum == 0")
         return -1
-    boundary_iou = intersection / union
-    return torch.tensor(boundary_iou).float().to(device)
+
+    return (2 * intersection + smooth) / (pred_sum + label_sum + smooth)
+
+
+# # General util function to get the boundary of a binary mask.
+# # https://gist.github.com/bowenc0221/71f7a02afee92646ca05efeeb14d687d
+# def mask_to_boundary(mask, dilation_ratio=0.02):
+#     """
+#     Convert binary mask to boundary mask.
+#     :param mask (numpy array, uint8): binary mask
+#     :param dilation_ratio (float): ratio to calculate dilation = dilation_ratio * image_diagonal
+#     :return: boundary mask (numpy array)
+#     """
+#     h, w = mask.shape
+#     img_diag = np.sqrt(h ** 2 + w ** 2)
+#     dilation = int(round(dilation_ratio * img_diag))
+#     if dilation < 1:
+#         dilation = 1
+#     # Pad image so mask truncated by the image border is also considered as boundary.
+#     new_mask = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+#     kernel = np.ones((3, 3), dtype=np.uint8)
+#     new_mask_erode = cv2.erode(new_mask, kernel, iterations=dilation)
+#     mask_erode = new_mask_erode[1 : h + 1, 1 : w + 1]
+#     # G_d intersects G in the paper.
+#     return mask - mask_erode
+
+
+# def boundary_iou(gt, dt, dilation_ratio=0.02):
+#     """
+#     Compute boundary iou between two binary masks.
+#     :param gt (numpy array, uint8): binary mask
+#     :param dt (numpy array, uint8): binary mask
+#     :param dilation_ratio (float): ratio to calculate dilation = dilation_ratio * image_diagonal
+#     :return: boundary iou (float)
+#     """
+#     device = gt.device
+#     dt = (dt>0)[0].cpu().byte().numpy()
+#     gt = (gt>128)[0].cpu().byte().numpy()
+
+#     gt_boundary = mask_to_boundary(gt, dilation_ratio)
+#     dt_boundary = mask_to_boundary(dt, dilation_ratio)
+#     intersection = ((gt_boundary * dt_boundary) > 0).sum()
+#     union = ((gt_boundary + dt_boundary) > 0).sum()
+#     if union == 0:
+#         print("Error: boundary_iou -> union == 0")
+#         return -1
+#     boundary_iou = intersection / union
+#     return torch.tensor(boundary_iou).float().to(device)

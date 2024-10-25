@@ -1,4 +1,4 @@
-from __future__ import print_function, division
+from __future__ import division
 
 import numpy as np
 import random
@@ -10,21 +10,30 @@ import os
 from glob import glob
 
 import torch
-from torch.utils.data import Dataset, DataLoader, ConcatDataset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, RandomSampler, BatchSampler
+from torch.utils.data.dataloader import default_collate
 from torchvision import transforms, utils
 from torchvision.transforms.functional import normalize
 import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
+import utils.misc as misc
 
-def get_data_dict(annotations, shuffle=False):
-    print("------------------------------Collecting Datasets--------------------------------")
+def get_data_dict(annotations, shuffle=True, logger=None):
+    if logger is not None:
+        print_func = print
+    else:
+        print_func = logger.info
+    if misc.is_main_process():
+        print_func("------------------------------Collecting Datasets--------------------------------")
     data_dict = []
     for i, annotation in enumerate(annotations):
         with open(annotation, 'r') as f:
-            dataset_name = f.readline().strip()
-            print("--->>>", " Dataset[",i,"] ", dataset_name," <<<---")
-            for line in f.readlines():
-                tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
+            data = f.readlines()
+            dataset_name = data[0].strip()
+            if misc.is_main_process():
+                print_func("--->>>", " Dataset[",i,"] ", dataset_name," <<<---")
+            tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
+            for line in data[1:]:
                 tmp_im_list.append(line.split(' | ')[0])
                 tmp_gt_list.append(line.split(' | ')[1])
                 tmp_caption_list.append(line.split(' ')[2].strip())
@@ -39,10 +48,12 @@ def get_data_dict(annotations, shuffle=False):
                                 "img_path":tmp_im_list,
                                 "gt_path":tmp_gt_list,
                                 "caption":tmp_caption_list})
+            if misc.is_main_process():
+                print_func(f"dataset length: {len(data_dict[-1]['img_path'])}")
 
     return data_dict
 
-def create_dataloaders(data_dict, my_transforms=[], batch_size=1, training=False):
+def create_dataloaders(data_dict, my_transforms=[], batch_size=1, training=False, dist=True):
     my_dataloaders = []
     my_datasets = []
 
@@ -64,19 +75,25 @@ def create_dataloaders(data_dict, my_transforms=[], batch_size=1, training=False
             my_datasets.append(my_dataset)
 
         my_dataset = ConcatDataset(my_datasets)
-        sampler = DistributedSampler(my_dataset)
-        batch_sampler_train = torch.utils.data.BatchSampler(
-            sampler, batch_size, drop_last=True)
-        dataloader = DataLoader(my_dataset, batch_sampler=batch_sampler_train, num_workers=num_workers_)
+        
+        if dist:
+            sampler = DistributedSampler(my_dataset)
+        else:
+            sampler = RandomSampler(my_dataset)
+        batch_sampler_train = BatchSampler(sampler, batch_size, drop_last=True)
+        dataloader = DataLoader(my_dataset, batch_sampler=batch_sampler_train, num_workers=num_workers_, collate_fn=collate_fn)
 
         my_dataloaders = dataloader
         my_datasets = my_dataset
 
     else:
         for i in range(len(data_dict)):   
-            my_dataset = MyDataset([data_dict[i]], transform = transforms.Compose(my_transforms), eval_ori_resolution = True)
-            sampler = DistributedSampler(my_dataset, shuffle=False)
-            dataloader = DataLoader(my_dataset, batch_size, sampler=sampler, drop_last=False, num_workers=num_workers_)
+            my_dataset = MyDataset([data_dict[i]], transform = transforms.Compose(my_transforms))
+            if dist:
+                sampler = DistributedSampler(my_dataset)
+            else:
+                sampler = RandomSampler(my_dataset)
+            dataloader = DataLoader(my_dataset, batch_size, sampler=sampler, drop_last=False, num_workers=num_workers_, collate_fn=collate_fn)
 
             my_dataloaders.append(dataloader)
             my_datasets.append(my_dataset)
@@ -208,7 +225,7 @@ class MyDataset(Dataset):
         img_path_list = [] # im path
         gt_path_list = [] # gt path
         caption_list = []
-        for i in range(0,len(data_dict)):
+        for i in range(len(data_dict)):
             dataset_names.append(data_dict[i]["dataset_name"])
             dt_name_list.extend([data_dict[i]["dataset_name"] for x in data_dict[i]["img_path"]])
             img_path_list.extend(data_dict[i]["img_path"])
@@ -221,6 +238,7 @@ class MyDataset(Dataset):
         self.dataset["ori_img_path"] = deepcopy(img_path_list)
         self.dataset["gt_path"] = gt_path_list
         self.dataset["ori_gt_path"] = deepcopy(gt_path_list)
+        self.dataset["caption"] = caption_list
 
     def __len__(self):
         return len(self.dataset["img_path"])
@@ -238,32 +256,49 @@ class MyDataset(Dataset):
             im = im[:, :, np.newaxis]
         if im.shape[2] == 1:
             im = np.repeat(im, 3, axis=2)
-        im = torch.tensor(im.copy(), dtype=torch.float32)
-        im = torch.transpose(torch.transpose(im,1,2),0,1)
+        img = torch.tensor(im.copy(), dtype=torch.float32)
+        img = torch.transpose(torch.transpose(img,1,2),0,1)
         gt = torch.unsqueeze(torch.tensor(gt, dtype=torch.float32),0)
         
-        assert torch.max(gt) != 0, f"{gt_path} \n"
+        # temporate processing
+        if torch.max(gt) == 0:
+            gt.fill_(255)
         
         sample = {
             "imidx": torch.from_numpy(np.array(idx)),
-            "image": im,
+            "image": img,
             "label": gt,
-            "caption": caption,
             "shape": torch.tensor(im.shape[-2:]),
         }
         
         if self.transform:
             sample = self.transform(sample)
             
-        image_tensor = torch.transpose(sample["image"], 0, 2).transpose(0, 1)
-    
-        image_tensor = image_tensor * 255 
-        image_tensor = image_tensor.byte()   
-        pil_image = Image.fromarray(image_tensor.numpy())
+        pil_image = Image.fromarray(im.numpy())
 
         sample["pil_image"] = pil_image
+        sample["caption"] = caption
         sample["ori_label"] = gt.type(torch.uint8)  
-        sample['ori_img_path'] = self.dataset["img_path"][idx]
-        sample['ori_gt_path'] = self.dataset["gt_path"][idx]
+        # sample['ori_img_path'] = self.dataset["img_path"][idx]
+        # sample['ori_gt_path'] = self.dataset["gt_path"][idx]
 
         return sample
+    
+def collate_fn(data):
+    imidxes = torch.stack([example["imidx"] for example in data])
+    images = torch.stack([example["image"] for example in data])
+    labels = torch.stack([example["label"] for example in data])
+    captions = [example["caption"] for example in data]
+    shapes = torch.stack([example["shape"] for example in data])
+    pil_images = [example["pil_image"] for example in data]
+    ori_lables = [example["ori_label"] for example in data]
+    
+    return {
+        "imidx" : imidxes,
+        "image" : images,
+        "label" : labels,
+        "caption" : captions,
+        "shape" : shapes,
+        "pil_image" : pil_images,
+        "label_ori" : ori_lables
+    }

@@ -3,9 +3,9 @@ import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 
-from typing import List, Tuple, Type, Optional
+from typing import List, Dict, Any, Tuple, Type, Optional
 
-from common import LayerNorm2d, LayerNorm1d, MLPBlock
+from .common import LayerNorm2d, LayerNorm1d, MLPBlock
 from segment_anything.modeling.transformer import Attention, TwoWayTransformer
 from segment_anything.modeling.prompt_encoder import PositionEmbeddingRandom
 
@@ -13,7 +13,7 @@ from segment_anything.modeling.prompt_encoder import PositionEmbeddingRandom
 class FGCtrlDecoder(nn.Module):
     def __init__(
         self, 
-        fgctrl_config: dict[list],
+        fgctrl_config: Dict[str, List],
         input_dim: int,
         output_dim: int,
         num_multimask_outputs: int = 3,
@@ -42,21 +42,32 @@ class FGCtrlDecoder(nn.Module):
         self.blocks = nn.ModuleList([])
         num_blocks = len(fgctrl_config["input_dim"])
         self.n_patches = fgctrl_config['n_patches']
-        for idx in range(num_blocks):
+        for idx in range(num_blocks-1):
             self.blocks.append(
                 FGCtrlBlock(
                     n_patches=self.n_patches,
                     input_dim=fgctrl_config['input_dim'][idx],
                     output_dim=fgctrl_config['output_dim'][idx],
                     transformer_depth=fgctrl_config['transformer_depth'][idx],
-                    downsample_rate=fgctrl_config['dowsample_rate'][idx]
+                    downsample_rate=fgctrl_config['downsample_rate'][idx]
                 )
             )
+        self.blocks.append(
+            FGCtrlBlock(
+                    n_patches=self.n_patches,
+                    input_dim=fgctrl_config['input_dim'][-1],
+                    output_dim=fgctrl_config['output_dim'][-1],
+                    transformer_depth=fgctrl_config['transformer_depth'][-1],
+                    downsample_rate=fgctrl_config['downsample_rate'][-1],
+                    last_block=True
+                )
+        )
+        
         self.pe_layer = PositionEmbeddingRandom(input_dim//2)
         
         self.num_multimask_outputs = num_multimask_outputs
         self.iou_token = nn.Embedding(1, input_dim)
-        self.num_mask_tokens = num_multimask_outputs + 1
+        self.num_mask_tokens = num_multimask_outputs
         self.mask_tokens = nn.Embedding(self.num_mask_tokens, input_dim)
 
         self.iou_prediction_head = MLP(
@@ -74,7 +85,7 @@ class FGCtrlDecoder(nn.Module):
         image_pe = self.pe_layer((image_embedding.size(2), image_embedding.size(3))).unsqueeze(0)
         
         masks, iou_pred = self.predict_masks(
-            image_embeddings=image_embedding,
+            image_embedding=image_embedding,
             image_pe=image_pe,
             clip_embedding = clip_embedding,
             clip_pe = clip_pe,
@@ -113,14 +124,8 @@ class FGCtrlDecoder(nn.Module):
                 block(image_embedding, image_pe, clip_embedding, clip_pe, tokens)
         iou_token_out = tokens[:, 0, :]
         mask_tokens_out = tokens[:, 1 : (1 + self.num_mask_tokens), :]
-
-        # Upscale mask embeddings and predict masks using the mask tokens
-        hyper_in_list: List[torch.Tensor] = []
-        for i in range(self.num_mask_tokens):
-            hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
-        hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = image_embedding.shape
-        masks = (hyper_in @ image_embedding.view(b, c, h * w)).view(b, -1, h, w)
+        masks = (mask_tokens_out @ image_embedding.view(b, c, h * w)).view(b, -1, h, w)
         
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
@@ -138,6 +143,7 @@ class FGCtrlBlock(nn.Module):
         attention_num_heads: int = 8,
         mlp_ratio: int = 2,
         activation: Type[nn.Module] = nn.GELU,
+        last_block: bool = False
         ):
         super().__init__()
         self.pca = PatchCrossAttn(
@@ -161,7 +167,8 @@ class FGCtrlBlock(nn.Module):
         self.upscaling = Upscaling(
             input_dim=input_dim,
             output_dim=output_dim,
-            activation=activation     
+            activation=activation,
+            is_last=last_block     
         )
     
     def forward(
@@ -184,18 +191,18 @@ class PatchCrossAttn(nn.Module):
         n_patches: int,
         embedding_dim: int,
         attention_num_heads: int,
-        downsample_rate: int = 4,
+        downsample_rate: int = 2,
         mlp_ratio: int = 2,
         activation: Type[nn.Module] = nn.SELU,
         ):
         super().__init__()
         self.n_patches = n_patches
         self.cross_attn_list = nn.ModuleList(
-            [Attention(embedding_dim, attention_num_heads, downsample_rate) for i in range(n_patches*n_patches)]
+            [Attention(embedding_dim, attention_num_heads, downsample_rate**2) for i in range(n_patches*n_patches)]
             )
         self.all_attn = Attention(embedding_dim, attention_num_heads, downsample_rate)
-        self.norm1 = LayerNorm2d(embedding_dim)
-        self.norm2 = LayerNorm2d(embedding_dim)
+        self.norm1 = nn.LayerNorm(embedding_dim)
+        self.norm2 = nn.LayerNorm(embedding_dim)
         self.mlp = MLPBlock(embedding_dim, embedding_dim*mlp_ratio)
         self.act = activation()
     
@@ -216,6 +223,8 @@ class PatchCrossAttn(nn.Module):
         combine_embedding = combine_embedding.permute(0, 3, 1, 4, 2, 5).contiguous()
         combine_embedding = combine_embedding.view(bs, c, h_s*n_patches, w_s*n_patches)
         
+        return combine_embedding
+        
     def forward(
         self,
         clip_embedding: Tensor,
@@ -227,22 +236,21 @@ class PatchCrossAttn(nn.Module):
         
         for patch_idx in range(self.n_patches * self.n_patches):
             split_patch = split_embedding[:, patch_idx, :, :, :]
-            split_patch = ((split_patch.squeeze(1)).permute(0,2,3,1)).view(bs, -1, c)
-            clip_patch = clip_embedding[:, patch_idx, :]
-            pe = pos_embedding[:, patch_idx, :]
+            split_patch = (split_patch.permute(0,2,3,1)).view(bs, -1, c)
+            clip_patch = clip_embedding[:, patch_idx, :].unsqueeze(1)
+            pe = pos_embedding[:, patch_idx, :].unsqueeze(1)
             attn_out = self.cross_attn_list[patch_idx](
                 q=split_patch,
                 k=clip_patch + pe,
                 v=clip_patch
             )
-            split_patch = split_patch + attn_out
-            split_embedding[:, patch_idx, :, :, :] = \
-                ((split_patch.view(bs, h//self.n_patches, w//self.n_patches, c)).permute(0, 3, 1, 2)).unsqueeze(1)
+            split_embedding[:, patch_idx, :, :, :] += \
+                ((attn_out.view(bs, h, w, c)).permute(0, 3, 1, 2))
 
         out_embedding = self.merge_embed(split_embedding, self.n_patches)
         
-        out_embedding.permute(0, 2, 3, 1).view(bs, -1, c)
-        image_clip = clip_embedding[:, -1, :]
+        out_embedding = out_embedding.permute(0, 2, 3, 1).view(bs, -1, c)
+        image_clip = clip_embedding[:, -1, :].unsqueeze(1)
         all_attn_out = self.all_attn(
             q=out_embedding,
             k=image_clip,
@@ -253,7 +261,7 @@ class PatchCrossAttn(nn.Module):
         out_embedding = self.norm1(out_embedding)
         mlp_out = self.mlp(out_embedding)
         out_embedding = self.norm2(out_embedding + mlp_out)
-        out_embedding.view(bs, h, w, c).permute(0, 3, 1, 2)
+        out_embedding = out_embedding.view(bs, h*self.n_patches, w*self.n_patches, c).permute(0, 3, 1, 2)
         
         return out_embedding
         
@@ -263,31 +271,38 @@ class Upscaling(nn.Module):
         input_dim: int,
         output_dim: int,
         activation: Type[nn.Module] = nn.GELU,
+        is_last: bool = False
         ):
         super().__init__()
         
         self.image_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(input_dim, input_dim // 4, kernel_size=2, stride=2),
-            LayerNorm2d(input_dim // 4),
+            nn.ConvTranspose2d(input_dim*2, input_dim // 2, kernel_size=2, stride=2),
+            LayerNorm2d(input_dim // 2),
             activation(),
-            ResBlock(input_dim//4, output_dim, activation)
+            MultiConvBlock(
+                input_dim//2, 
+                output_dim*2, 
+                activation, 
+                shortcut=nn.Conv2d(input_dim//2, output_dim*2, kernel_size=1, bias=False),
+                norm_output=not is_last
+                )
         )
         
         self.clip_proj = MLP(
-            input_dim=input_dim*2,
-            hidden_dim=input_dim*2,
-            output_dim=output_dim*2,
-            num_layers=3
+            input_dim=input_dim,
+            hidden_dim=input_dim,
+            output_dim=output_dim,
+            num_layers=3,
+            norm_output=not is_last
         )
         
         self.token_proj = MLP(
             input_dim=input_dim,
             hidden_dim=input_dim,
             output_dim=output_dim,
-            num_layers=3
+            num_layers=3,
+            norm_output=not is_last
         )
-        
-        self.pe_upscaling = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
     
     def forward(
         self,
@@ -297,8 +312,10 @@ class Upscaling(nn.Module):
         clip_pe: Tensor,
         tokens: Tensor,
     ):
-        upscaled_image = self.image_upscaling(image_embedding)
-        upscaled_pe = self.pe_upscaling(image_pe)
+        concat = torch.cat([image_embedding, image_pe], dim=1)
+        upscaled = self.image_upscaling(concat)
+        upscaled_image = upscaled[:, :upscaled.size(1)//2, :, :]
+        upscaled_pe = upscaled[:, upscaled.size(1)//2:, :, :]
         
         num_embedding = clip_embedding.size(1)
         clip_cat = torch.cat([clip_embedding, clip_pe], dim=1)
@@ -321,15 +338,19 @@ class ResBlock(nn.Module):
         super(ResBlock, self).__init__()
         self.cnn = nn.Sequential(
             nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False),
-            LayerNorm2d(in_channels),
             activation(),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            LayerNorm2d(out_channels)       
+            nn.Conv2d(in_channels, in_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            activation(),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),      
         )
         self.shortcut = shortcut
+        self.norm = LayerNorm2d(out_channels)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.shortcut(x) + self.cnn(x)
+        try:
+            return self.norm(self.shortcut(x) + self.cnn(x))
+        except:
+            return self.norm(x + self.cnn(x))
     
 # Lightly adapted from segment_anything/modeling/mask_decoder.py
 class MLP(nn.Module):
@@ -350,6 +371,8 @@ class MLP(nn.Module):
         )
         self.sigmoid_output = sigmoid_output
         self.norm_output = norm_output
+        if self.norm_output:
+            self.norm = nn.LayerNorm(output_dim)
 
     def forward(self, x):
         for i, layer in enumerate(self.layers):
@@ -357,5 +380,45 @@ class MLP(nn.Module):
         if self.sigmoid_output:
             x = F.sigmoid(x)
         elif self.norm_output:
-            x = LayerNorm1d(x)
+            x = self.norm(x)
         return x
+
+class MultiConvBlock(nn.Module):
+    def __init__(
+        self, 
+        in_channels: int, 
+        out_channels: int, 
+        activation: Type[nn.Module] = nn.GELU,
+        shortcut: Optional[nn.Module] = None,
+        norm_output: bool = True
+        ):
+        super().__init__()
+        
+        self.conv3 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False)
+        self.conv5 = nn.Conv2d(in_channels, in_channels, kernel_size=5, padding=2, bias=False)
+        self.conv7 = nn.Conv2d(in_channels, in_channels, kernel_size=7, padding=3, bias=False)
+        
+        self.output = nn.Sequential(
+            activation(),
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            activation()
+        )
+        
+        self.shortcut = shortcut
+        self.norm_output = norm_output
+        if self.norm_output:
+            self.norm = LayerNorm2d(out_channels)
+
+    def forward(self, x):
+        out3 = self.conv3(x)
+        out5 = self.conv5(x)
+        out7 = self.conv7(x)
+        out = out3 + out5 + out7     
+        if self.shortcut is not None:   
+            out = self.shortcut(x) + self.output(out)
+        else:
+            out = x + self.output(out)
+        if self.norm_output:
+            return self.norm(out)
+        else:
+            return out

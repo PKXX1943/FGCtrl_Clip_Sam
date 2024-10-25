@@ -6,7 +6,9 @@ def show_anns(masks, gt_mask, filename, image, ious, boundary_ious):
     if len(masks) == 0:
         return
     for i, (mask, iou, biou) in enumerate(zip(masks, ious, boundary_ious)):
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        # image = cv2.cvtColor((np.array(image)), cv2.COLOR_BGR2GRAY)
+        image = np.array(image)
+        image = np.zeros((image.shape[1], image.shape[2], 3))
         plt.figure(figsize=(10,10))
         plt.imshow(image, cmap='gray')
         show_mask(mask, plt.gca(), 1)

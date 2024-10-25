@@ -12,3 +12,6 @@ irrelavance/
 data
 sam_hq/
 biomed_clip/
+pretrained/
+output/
+debug/

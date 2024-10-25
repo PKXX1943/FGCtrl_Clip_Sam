@@ -7,8 +7,8 @@ from typing import Any, Dict, List, Tuple
 
 from functools import partial
 
-from clip_encoder import ClipEncoder
-from fgctrl_decoder import FGCtrlDecoder
+from .clip_encoder import ClipEncoder
+from .fgctrl_decoder import FGCtrlDecoder
 from segment_anything.modeling import ImageEncoderViT
 
 class FGCtrlClipSam(nn.Module):
@@ -23,7 +23,7 @@ class FGCtrlClipSam(nn.Module):
         pixel_mean: List[float] = [123.675, 116.28, 103.53],
         pixel_std: List[float] = [58.395, 57.12, 57.375],
     ):
-        super.__init__()
+        super().__init__()
         self.image_encoder = sam_image_encoder
         self.clip_encoder = clip_encoder
         self.decoder = fgctrl_decoder
@@ -39,7 +39,7 @@ class FGCtrlClipSam(nn.Module):
         batched_input : dict,
         multimask_output: bool = False
     ):
-        image_inputs = self.preprocess(batched_input["image"].to(self.device()))
+        image_inputs = self.preprocess(batched_input["image"].to(self.device))
         with torch.no_grad():
             image_embedding = self.image_encoder(image_inputs)
         pil_images = batched_input["pil_image"]
@@ -53,7 +53,7 @@ class FGCtrlClipSam(nn.Module):
         )
         masks = self.postprocess_masks(
                 mask_logits,
-                input_size=masks.shape[-2:],
+                input_size=mask_logits.shape[-2:],
                 original_size=batched_input["image"].shape[-2:],
             )
         masks = masks > self.mask_threshold

@@ -17,13 +17,13 @@ from validate import val
 def get_args_parser():
     parser = argparse.ArgumentParser('FGCtrl_Clip_Sam', add_help=False)
 
-    parser.add_argument("--output", type=str, required=True,
+    parser.add_argument("--output", type=str, required=True, 
                         help="Path to the directory where masks and checkpoints will be output")
     parser.add_argument("--sam_model_type", type=str, default="vit_l", 
                         help="The type of sam model to load, in ['vit_h', 'vit_l', 'vit_b']")
     parser.add_argument("--model_type", type=str, default="4patches_256", 
                         help="The type of model to load, in ['4patches_256']")
-    parser.add_argument("--sam_checkpoint", type=str, default="pretrained/sam_vit_l_0b3195.pth",
+    parser.add_argument("--sam_checkpoint", type=str, required=True, 
                         help="The path to the SAM checkpoint to use for image encoding.")
     parser.add_argument("--model_checkpoint", type=str, default=None, 
                         help="The path to the model checkpoint to use for mask generation.")
@@ -38,58 +38,80 @@ def get_args_parser():
     parser.add_argument('--input_size', default=[1024,1024], type=list)
     parser.add_argument('--batch_size_train', default=16, type=int)
     parser.add_argument('--batch_size_valid', default=4, type=int)
-    parser.add_argument('--model_save_freq', default=1, type=int)
+    parser.add_argument('--model_save_freq', default=2, type=int)
     parser.add_argument('--log_freq', default=100, type=int)  
     parser.add_argument('--logger', default='train.log', type=str)  
+
+    parser.add_argument('--world_size', default=1, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    parser.add_argument('--rank', default=0, type=int,
+                        help='number of distributed processes')
+    parser.add_argument('--local_rank', type=int, help='local rank for dist')
+    parser.add_argument('--find_unused_params', action='store_true')
+
     parser.add_argument('--visualize', default=0, type=int)
 
     return parser.parse_args()
 
 
 def train(train_data, val_data, model, args, logger):
+    
+    misc.init_distributed_mode(args)
+    if misc.is_main_process():
+        logger.info('world size: {}'.format(args.world_size))
+        logger.info('rank: {}'.format(args.rank))
+        logger.info('local_rank: {}'.format(args.local_rank))
+        logger.info(f"args: {str(args)}\n")
 
-    logger.info(f"args: {str(args)}\n")
-
-    seed = args.seed
+    seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+    
+    
 
     ### --- Step 1: Train or Valid dataset ---
-    
-    logger.info("--- create training dataloader ---")
+    if misc.is_main_process():
+        logger.info("--- create training dataloader ---")
     train_dataloaders, train_datasets = create_dataloaders(train_data,
                                                     my_transforms = [
                                                                 RandomHFlip(),
-                                                                LargeScaleJitter()
+                                                                Resize(args.input_size)
                                                                 ],
-                                                    batch_size = args.batch_size_train,
-                                                    training = True,
-                                                    dist=False)
-    logger.info(f"train dataloader length : {len(train_dataloaders)}")
-
-    logger.info("--- create valid dataloader ---")
+                                                    batch_size=args.batch_size_train,
+                                                    training=True,
+                                                    )
+    if misc.is_main_process():
+        logger.info(f"train dataloader length: {len(train_dataloaders)}")
+        logger.info("--- create valid dataloader ---")
     valid_dataloaders, valid_datasets = create_dataloaders(val_data,
                                                           my_transforms = [
                                                                         Resize(args.input_size)
                                                                     ],
                                                           batch_size=args.batch_size_valid,
                                                           training=False,
-                                                          dist=False)
-    logger.info(f"{len(valid_dataloaders)} dataloaders created")
+                                                        )
+    if misc.is_main_process():
+        logger.info(f"{len(valid_dataloaders)}valid dataloaders created")
     
-    ### --- Step 2: Model Setup ---
+    ### --- Step 2: DistributedDataParallel---
     
-    model.to(device=args.device)
+    if torch.cuda.is_available():
+        model.cuda()
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=args.find_unused_params)
+    model_without_ddp = model.module
+
  
     ### --- Step 3: Optimizer ---
-    
-    logger.info("--- define optimizer ---")
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
+    if misc.is_main_process():
+        logger.info("--- define optimizer ---")
+    optimizer = optim.Adam(model_without_ddp.parameters(), lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=0)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, args.lr_drop_epoch)
     lr_scheduler.last_epoch = args.start_epoch
     
-    os.makedirs(args.output, exist_ok=True)
+    if misc.is_main_process():
+        os.makedirs(args.output, exist_ok=True)
 
     epoch_start = args.start_epoch
     epoch_num = args.max_epoch_num
@@ -98,39 +120,51 @@ def train(train_data, val_data, model, args, logger):
     ### --- Step 4: Train epochs ---
 
     model.train()
-    
-    # test_stats = val(args, model, valid_dataloaders, logger=logger)
-    # train_stats.update(test_stats)
+    _ = model.to(device=args.device)
     
     for epoch in range(epoch_start, epoch_num): 
-        logger.info(f"epoch:    {epoch} learning rate:  {optimizer.param_groups[0]['lr']} ")
+        if misc.is_main_process():
+            logger.info(f"epoch:   {epoch}  learning rate:  {optimizer.param_groups[0]['lr']}")
+            
+        # if epoch == epoch_start:
+        #     logger.info(f"Validate before the first epoch ...")
+        #     test_stats = val(args, model, valid_dataloaders, logger=logger)
+        
         metric_logger = misc.MetricLogger(delimiter="  ")
-
-        for data in metric_logger.log_every(train_dataloaders, args.log_freq, logger=logger):
+        train_dataloaders.batch_sampler.sampler.set_epoch(epoch)
+        
+        for data in metric_logger.log_every(train_dataloaders, args.log_freq, logger=logger, is_main_proc=misc.is_main_process()):
             output = model(
                 batched_input=data, multimask_output=False
             )
             mask_logits = output["logits"]
             labels = data['label'].to(mask_logits.device)
             
-            loss_mask, loss_dice = loss_masks(mask_logits, labels / 255.0, len(mask_logits))
+            loss_mask, loss_dice = loss_masks(mask_logits, labels/255.0, len(mask_logits))
             loss = loss_mask + loss_dice
             
-            loss_dict = {"loss_mask": loss_mask, "loss_dice": loss_dice}
+            loss_dict = {"loss_mask": loss_mask, "loss_dice":loss_dice}
+
+            # reduce losses over all GPUs for logging purposes
+            loss_dict_reduced = misc.reduce_dict(loss_dict)
+            losses_reduced_scaled = sum(loss_dict_reduced.values())
+            loss_value = losses_reduced_scaled.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            metric_logger.update(training_loss=loss.item(), **loss_dict)
+            metric_logger.update(training_loss=loss_value, **loss_dict_reduced)
 
         ### --- Step 5: Update loggers ---
-
-        logger.info(f"Finished epoch:      {epoch}")
+        if misc.is_main_process():
+            logger.info(f"Finished epoch: {epoch}")
         metric_logger.synchronize_between_processes()
-        logger.info(f"Averaged stats:  {metric_logger}")
+        if misc.is_main_process():
+            logger.info(f"Averaged stats: {metric_logger}")
+            logger.info("\n\n\n")
         train_stats = {k: meter.global_avg for k, meter in metric_logger.meters.items() if meter.count > 0}
-        
+
         lr_scheduler.step()
         test_stats = val(args, model, valid_dataloaders, logger=logger)
         train_stats.update(test_stats)
@@ -140,10 +174,14 @@ def train(train_data, val_data, model, args, logger):
         if epoch % args.model_save_freq == 0:
             model_name = f"/{args.logger.split('.')[0]}_epoch_{str(epoch)}.pth"
             if misc.is_main_process():
-                logger.info('model save at', args.output + model_name)
+                logger.info(f'model save at {args.output + model_name}')
             misc.save_on_master(model.module.state_dict(), args.output + model_name)
     
-    logger.info("Training Reaches The Maximum Epoch Number")
+    # Finish training
+    if misc.is_main_process():
+        logger.info("Training Reaches The Maximum Epoch Number")
+    
+
 
 if __name__ == "__main__":
 
@@ -173,4 +211,4 @@ if __name__ == "__main__":
         model_checkpoint=args.model_checkpoint
     )
 
-    train(train_data, val_data, model, args, logger)
+    train(train_data, val_data, model, args, logger=logger)
