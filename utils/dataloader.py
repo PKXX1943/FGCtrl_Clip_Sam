@@ -274,7 +274,7 @@ class MyDataset(Dataset):
         if self.transform:
             sample = self.transform(sample)
             
-        pil_image = Image.fromarray(im.numpy())
+        pil_image = Image.fromarray(im)
 
         sample["pil_image"] = pil_image
         sample["caption"] = caption
