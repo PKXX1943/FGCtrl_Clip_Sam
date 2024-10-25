@@ -148,7 +148,7 @@ if __name__ == "__main__":
         "data/busi/annotations/val.txt"
     ]
 
-    val_data = get_data_dict(val_annotations)
+    val_data = get_data_dict(val_annotations, logger=logger)
     valid_dataloaders, valid_datasets = create_dataloaders(
         val_data,
         my_transforms = [Resize(args.input_size)],
