@@ -61,7 +61,7 @@ def train(train_data, val_data, model, args, logger):
     train_dataloaders, train_datasets = create_dataloaders(train_data,
                                                     my_transforms = [
                                                                 RandomHFlip(),
-                                                                LargeScaleJitter()
+                                                                Resize(args.input_size)
                                                                 ],
                                                     batch_size = args.batch_size_train,
                                                     training = True,
