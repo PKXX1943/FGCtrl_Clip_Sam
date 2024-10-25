@@ -159,12 +159,12 @@ if __name__ == "__main__":
         "data/retinal/annotations/val.txt",
         "data/busi/annotations/val.txt"
     ]
-
-    train_data = get_data_dict(train_annotations) 
-    val_data = get_data_dict(val_annotations)
-    args = get_args_parser()
     
+    args = get_args_parser()
     logger = setup_logger(os.path.join(args.output, args.logger))
+    
+    train_data = get_data_dict(train_annotations, logger=logger) 
+    val_data = get_data_dict(val_annotations, logger=logger)
     
     model = build_model_biomedclip(
         sam_model_type=args.sam_model_type,

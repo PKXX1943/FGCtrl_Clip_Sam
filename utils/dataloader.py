@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 import utils.misc as misc
 
 def get_data_dict(annotations, shuffle=True, logger=None):
-    if logger is not None:
+    if logger is None:
         print_func = print
     else:
         print_func = logger.info
