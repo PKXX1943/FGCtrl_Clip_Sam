@@ -31,12 +31,12 @@ def get_data_dict(annotations, shuffle=True, logger=None):
             data = f.readlines()
             dataset_name = data[0].strip()
             if misc.is_main_process():
-                print_func("--->>>", " Dataset[",i,"] ", dataset_name," <<<---")
+                print_func(f"--->>> Dataset[{i}]  {dataset_name} <<<---")
             tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
             for line in data[1:]:
                 tmp_im_list.append(line.split(' | ')[0])
                 tmp_gt_list.append(line.split(' | ')[1])
-                tmp_caption_list.append(line.split(' ')[2].strip())
+                tmp_caption_list.append(line.split(' | ')[2].strip())
             if shuffle:
                 combined = list(zip(tmp_im_list, tmp_gt_list, tmp_caption_list))
                 random.shuffle(combined)

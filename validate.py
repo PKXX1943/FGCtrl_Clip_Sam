@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import random
 import time
-from utils.build_model import build_model_biomedclip
+from utils.build_model import build_model_biomedclip, build_model_laion_clip
 from utils.dataloader import get_data_dict, create_dataloaders,Resize
 from utils.visualize import show_anns
 import utils.misc as misc
@@ -16,10 +16,14 @@ def get_args_parser():
 
     parser.add_argument("--output", type=str, required=True, 
                         help="Path to the directory where masks and checkpoints will be output")
+    parser.add_argument("--dataset", type=str, required=True, 
+                        help="Dataset: ['Med', 'ADE20K']")
     parser.add_argument("--sam_model_type", type=str, default="vit_l", 
                         help="The type of sam model to load, in ['vit_h', 'vit_l', 'vit_b']")
     parser.add_argument("--model_type", type=str, default="4patches_256", 
                         help="The type of model to load, in ['4patches_256']")
+    parser.add_argument("--clip", type=str, default="biomed_clip", 
+                        help="The type of clip model to load, in ['biomed_clip', 'laion_clip']")
     parser.add_argument("--sam_checkpoint", type=str, required=True, 
                         help="The path to the SAM checkpoint to use for image encoding.")
     parser.add_argument("--model_checkpoint", type=str, default=None, 
@@ -40,8 +44,9 @@ def get_args_parser():
     parser.add_argument('--logger', default='train.log', type=str)
 
     parser.add_argument('--visualize', default=0, type=int)
-    parser.add_argument("--restore-model", type=str,
-                        help="The path to model's training checkpoint for evaluation")
+    parser.add_argument('--similarities', action='store_true')
+    # parser.add_argument("--restore-model", type=str,
+    #                     help="The path to model's training checkpoint for evaluation")
 
     return parser.parse_args()
 
@@ -56,12 +61,13 @@ def val(args, model, valid_dataloaders, logger=None):
         valid_dataloader = valid_dataloaders[k]
         if misc.is_main_process():
             logger.info(f'valid_dataloader[{k}] len:{len(valid_dataloader)}')
-
+        vis_num = 0
+        
         for data_val in (metric_logger.log_every(valid_dataloader, args.log_freq, logger=logger, is_main_proc=misc.is_main_process())):
         
             with torch.no_grad():
                 output = model(
-                    batched_input=data_val, multimask_output=False
+                    batched_input=data_val, similarities=args.similarities, multimask_output=False
                 )
             mask_logits = output["logits"]
             labels_ori = data_val["label_ori"]
@@ -71,7 +77,6 @@ def val(args, model, valid_dataloaders, logger=None):
             if args.visualize > 0:
                 if misc.is_main_process():
                     logger.info(f"visualize")
-                vis_num = 0
                 masks_vis = output["masks"].cpu()
                 gt_vis = torch.stack([(F.interpolate(label_ori.detach().unsqueeze(0), (1024, 1024)) > 0).cpu() for label_ori in labels_ori])
                 
@@ -87,7 +92,7 @@ def val(args, model, valid_dataloaders, logger=None):
                         os.makedirs(outdir)
                     elif not os.path.exists(outdir):
                         time.sleep(1)
-                    filename = os.path.join(outdir, f"dataset{k}_{base:03d}.jpg")
+                    filename = os.path.join(outdir, f"dataset{k}_img{base:03d}")
                     show_anns(masks_vis[ii], gt_vis[ii], filename, img, show_iou, show_dice)
                     
             loss_dict = {"val_iou_"+str(k): iou, "val_dice_"+str(k): dice}
@@ -140,14 +145,20 @@ def compute_dice(preds, targets):
 if __name__ == "__main__":
     args = get_args_parser()
     logger = setup_logger(os.path.join(args.output, args.logger))
-
-    val_annotations = [
-        "data/brain_mri_kaggle3m/annotations/val.txt",
-        "data/kvasir_seg/annotations/val.txt",
-        "data/retinal/annotations/val.txt",
-        "data/busi/annotations/val.txt"
-    ]
-
+    if args.dataset == 'Med':
+        val_annotations = [
+            "data/brain_mri_kaggle3m/annotations/val_clear.txt",
+            "data/kvasir_seg/annotations/val_clear.txt",
+            "data/retinal/annotations/val_clear.txt",
+            "data/busi/annotations/val_clear.txt"
+        ]
+    elif args.dataset == 'ADE20K':
+        val_annotations = [
+            "prepared/val.txt"
+        ]
+    else:
+        raise NotImplementedError
+    
     val_data = get_data_dict(val_annotations, logger=logger)
     valid_dataloaders, valid_datasets = create_dataloaders(
         val_data,
@@ -157,12 +168,21 @@ if __name__ == "__main__":
         dist=False
     )
     
-    model = build_model_biomedclip(
-        sam_model_type=args.sam_model_type,
-        sam_checkpoint=args.sam_checkpoint,
-        model_type = args.model_type,
-        
-        model_checkpoint=args.model_checkpoint
-    )
+    if args.clip == 'biomed_clip':
+        model = build_model_biomedclip(
+            sam_model_type=args.sam_model_type,
+            sam_checkpoint=args.sam_checkpoint,
+            model_type = args.model_type,
+            model_checkpoint=args.model_checkpoint
+        )
+    elif args.clip == 'laion_clip':
+        model = build_model_laion_clip(
+            sam_model_type=args.sam_model_type,
+            sam_checkpoint=args.sam_checkpoint,
+            model_type = args.model_type,
+            model_checkpoint=args.model_checkpoint
+        )
+    else:
+        raise NotImplementedError
 
     val(args, model, valid_dataloaders, logger=logger)

@@ -63,10 +63,10 @@ class ClipHead(nn.Module):
     ) -> None:
         super().__init__()
         self.pos_embed = PositionEmbeddingRandom(out_dim//2,)
-        self.lin1_img = nn.Linear(embedding_dim, mlp_dim)
-        self.lin2_img = nn.Linear(mlp_dim, out_dim)
-        self.lin1_text = nn.Linear(embedding_dim, mlp_dim)
-        self.lin2_text = nn.Linear(mlp_dim, out_dim)
+        self.lin1_img = nn.Linear(embedding_dim, out_dim)
+        # self.lin2_img = nn.Linear(mlp_dim, out_dim)
+        self.lin1_text = nn.Linear(embedding_dim, out_dim)
+        # self.lin2_text = nn.Linear(mlp_dim, out_dim)
         self.norm =nn.LayerNorm(out_dim)
         self.act = act()
         self.learnable_pe = learnable_pe
@@ -92,8 +92,10 @@ class ClipHead(nn.Module):
         ):
         bs = image_embedding.size(0)
         pe = self.pos_embed(n_patches)
-        img_out = self.norm(self.lin2_img(self.act(self.lin1_img(image_embedding))))
-        text_out = self.norm(self.lin2_text(self.act(self.lin1_text(text_embedding))))
+        # img_out = self.norm(self.lin2_img(self.act(self.lin1_img(image_embedding))))
+        # text_out = self.norm(self.lin2_text(self.act(self.lin1_text(text_embedding))))
+        img_out = self.norm(self.lin1_img(image_embedding))
+        text_out = self.norm(self.lin1_text(text_embedding))
         
         return img_out, text_out, pe.unsqueeze(0).expand(img_out.size(0), -1, -1)
         
@@ -105,6 +107,7 @@ class ClipEncoder(nn.Module):
         out_dim: int = 256,
         clip_model: str = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
         tokenizer: str = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
+        context_length : int = 256,
         learnable_pe: bool = True,
         num_text_embeddings: int = 1
     ):
@@ -124,6 +127,7 @@ class ClipEncoder(nn.Module):
         
         self.model, self.preprocess = create_model_from_pretrained(clip_model)
         self.tokenizer = get_tokenizer(tokenizer)
+        self.context_length = context_length
         self.head = ClipHead(
             embedding_dim=embedding_dim,
             mlp_dim=out_dim,
@@ -162,7 +166,9 @@ class ClipEncoder(nn.Module):
         resized_image = transform_to_pil(resized_tensor.squeeze(0))  
         
         return resized_image
-
+    
+    def cal_similarities(self, image_features, text_feature):
+        return F.cosine_similarity(image_features, text_feature.unsqueeze(0), dim=1)   
     
     def forward(
         self, 
@@ -170,7 +176,6 @@ class ClipEncoder(nn.Module):
         batch_captions: list,
         n_patches: int = 4,
         target_size: Tuple = (1024, 1024),
-        context_length: int = 256,
         ):
         assert len(batch_captions) == len(batch_images)
         bs = len(batch_images)
@@ -181,13 +186,15 @@ class ClipEncoder(nn.Module):
             captions.extend([caption] * (n_patches*n_patches + 1))
             images.append(self.resize_image(image, target_size))
         image_tensor = torch.stack([self.preprocess(img) for img in images]).to(self.device)
-        text_tensor = self.tokenizer(captions, context_length=context_length).to(self.device)
+        text_tensor = self.tokenizer(captions, context_length=self.context_length).to(self.device)
         with torch.no_grad():
             image_embedding, text_embedding, _ = self.model(image_tensor, text_tensor)
+        sim = self.cal_similarities(image_embedding, text_embedding[0])
+        sim = sim.view(bs, n_patches*n_patches+1)
         image_embedding = image_embedding.view(bs, n_patches*n_patches+1, -1)
         text_embedding = text_embedding.view(bs, n_patches*n_patches+1, -1)
         img_out, text_out, pe = self.head(n_patches, image_embedding, text_embedding[:, :self.num_text_embeddings, :])
-        return img_out, text_out, pe
+        return img_out, text_out, pe, sim
 
         
         

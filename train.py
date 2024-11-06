@@ -6,7 +6,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import random
 
-from utils.build_model import build_model_biomedclip
+from utils.build_model import build_model_biomedclip, build_model_laion_clip
 from utils.dataloader import get_data_dict, create_dataloaders, RandomHFlip, Resize, LargeScaleJitter
 from utils.loss import loss_masks
 import utils.misc as misc
@@ -19,10 +19,14 @@ def get_args_parser():
 
     parser.add_argument("--output", type=str, required=True,
                         help="Path to the directory where masks and checkpoints will be output")
+    parser.add_argument("--dataset", type=str, required=True, 
+                        help="Dataset: ['Med', 'ADE20K']")
     parser.add_argument("--sam_model_type", type=str, default="vit_l", 
                         help="The type of sam model to load, in ['vit_h', 'vit_l', 'vit_b']")
     parser.add_argument("--model_type", type=str, default="4patches_256", 
                         help="The type of model to load, in ['4patches_256']")
+    parser.add_argument("--clip", type=str, default="biomed_clip", 
+                        help="The type of clip model to load, in ['biomed_clip', 'laion_clip']")
     parser.add_argument("--sam_checkpoint", type=str, default="pretrained/sam_vit_l_0b3195.pth",
                         help="The path to the SAM checkpoint to use for image encoding.")
     parser.add_argument("--model_checkpoint", type=str, default=None, 
@@ -42,6 +46,8 @@ def get_args_parser():
     parser.add_argument('--log_freq', default=100, type=int)  
     parser.add_argument('--logger', default='train.log', type=str)  
     parser.add_argument('--visualize', default=0, type=int)
+    
+    parser.add_argument('--similarities', action='store_true')
 
     return parser.parse_args()
 
@@ -108,7 +114,7 @@ def train(train_data, val_data, model, args, logger):
 
         for data in metric_logger.log_every(train_dataloaders, args.log_freq, logger=logger):
             output = model(
-                batched_input=data, multimask_output=False
+                batched_input=data, similarities=args.similarities, multimask_output=False
             )
             mask_logits = output["logits"]
             labels = data['label'].to(mask_logits.device)
@@ -141,36 +147,57 @@ def train(train_data, val_data, model, args, logger):
             model_name = f"/{args.logger.split('.')[0]}_epoch_{str(epoch)}.pth"
             if misc.is_main_process():
                 logger.info('model save at', args.output + model_name)
-            misc.save_on_master(model.module.state_dict(), args.output + model_name)
+            misc.save_on_master(model.modules.state_dict(), args.output + model_name)
     
     logger.info("Training Reaches The Maximum Epoch Number")
 
 if __name__ == "__main__":
 
-    train_annotations = [
-        "data/brain_mri_kaggle3m/annotations/train.txt",
-        "data/kvasir_seg/annotations/train.txt",
-        "data/retinal/annotations/train_4copies.txt",
-        "data/busi/annotations/train.txt"
-    ]
-    val_annotations = [
-        "data/brain_mri_kaggle3m/annotations/val.txt",
-        "data/kvasir_seg/annotations/val.txt",
-        "data/retinal/annotations/val.txt",
-        "data/busi/annotations/val.txt"
-    ]
-    
     args = get_args_parser()
     logger = setup_logger(os.path.join(args.output, args.logger))
+    
+    if args.dataset == 'Med':
+        train_annotations = [
+            "data/brain_mri_kaggle3m/annotations/train_clear.txt",
+            "data/kvasir_seg/annotations/train_clear.txt",
+            "data/retinal/annotations/train_4copies.txt",
+            "data/busi/annotations/train_clear.txt"
+        ]
+        val_annotations = [
+            "data/brain_mri_kaggle3m/annotations/val_clear.txt",
+            "data/kvasir_seg/annotations/val_clear.txt",
+            "data/retinal/annotations/val_clear.txt",
+            "data/busi/annotations/val_clear.txt"
+        ]
+    elif args.dataset == 'ADE20K':
+        train_annotations = [
+            "prepared/train.txt"
+        ]
+        val_annotations = [
+            "prepared/val.txt"
+        ]
+    else:
+        raise NotImplementedError
     
     train_data = get_data_dict(train_annotations, logger=logger) 
     val_data = get_data_dict(val_annotations, logger=logger)
     
-    model = build_model_biomedclip(
-        sam_model_type=args.sam_model_type,
-        sam_checkpoint=args.sam_checkpoint,
-        model_type = args.model_type,
-        model_checkpoint=args.model_checkpoint
-    )
-
-    train(train_data, val_data, model, args, logger)
+    if args.clip == 'biomed_clip':
+        model = build_model_biomedclip(
+            sam_model_type=args.sam_model_type,
+            sam_checkpoint=args.sam_checkpoint,
+            model_type = args.model_type,
+            model_checkpoint=args.model_checkpoint
+        )
+    elif args.clip == 'laion_clip':
+        model = build_model_laion_clip(
+            sam_model_type=args.sam_model_type,
+            sam_checkpoint=args.sam_checkpoint,
+            model_type = args.model_type,
+            model_checkpoint=args.model_checkpoint
+        )
+    else:
+        raise NotImplementedError
+    
+    with torch.autograd.set_detect_anomaly(True):
+        train(train_data, val_data, model, args, logger)

@@ -16,6 +16,7 @@ class FGCtrlDecoder(nn.Module):
         fgctrl_config: Dict[str, List],
         input_dim: int,
         output_dim: int,
+        vit_dim: int = 1024,
         num_multimask_outputs: int = 3,
         iou_head_depth: int = 3,
         iou_head_hidden_dim: int = 256,
@@ -40,6 +41,8 @@ class FGCtrlDecoder(nn.Module):
           iou_head_hidden_dim : the hidden dimension of the MLP used to predict mask quality
         """
         self.blocks = nn.ModuleList([])
+        # self.compress_vit_feat = nn.ModuleList([])
+        # self.emebedding_encoder = nn.ModuleList([])
         num_blocks = len(fgctrl_config["input_dim"])
         self.n_patches = fgctrl_config['n_patches']
         for idx in range(num_blocks-1):
@@ -73,23 +76,47 @@ class FGCtrlDecoder(nn.Module):
         self.iou_prediction_head = MLP(
             output_dim, iou_head_hidden_dim, self.num_mask_tokens, iou_head_depth
         )
+        self.compress_vit_feat = nn.Sequential(
+            nn.ConvTranspose2d(vit_dim, input_dim, kernel_size=2, stride=2),
+            LayerNorm2d(input_dim),
+            nn.GELU(), 
+            nn.ConvTranspose2d(input_dim, output_dim, kernel_size=2, stride=2)
+        )
         
+        self.embedding_encoder = nn.Sequential(
+            nn.ConvTranspose2d(input_dim, input_dim // 4, kernel_size=2, stride=2),
+            LayerNorm2d(input_dim // 4),
+            nn.GELU(), 
+            nn.ConvTranspose2d(input_dim // 4, output_dim, kernel_size=2, stride=2)
+        )
+
+        self.embedding_maskfeature = nn.Sequential(
+            nn.Conv2d(output_dim, output_dim * 2, 3, 1, 1), 
+            LayerNorm2d(output_dim * 2),
+            nn.GELU(),
+            nn.Conv2d(output_dim * 2, output_dim, 3, 1, 1)
+        )
+
     def forward(
         self,
         image_embedding: Tensor,
+        vit_embedding: Tensor,
         clip_embedding: Tensor,
         clip_pe: Tensor,
         text_embedding: Tensor,
-        multimask_output: bool,
+        similarity: Tensor = None,
+        multimask_output: bool = False,
     ):
         image_pe = self.pe_layer((image_embedding.size(2), image_embedding.size(3))).unsqueeze(0)
         
         masks, iou_pred = self.predict_masks(
             image_embedding=image_embedding,
+            vit_embedding = vit_embedding,
             image_pe=image_pe,
             clip_embedding = clip_embedding,
             clip_pe = clip_pe,
-            text_embedding = text_embedding
+            text_embedding = text_embedding,
+            similarity = similarity,
         )
 
         # Select the correct mask or masks for outptu
@@ -106,11 +133,16 @@ class FGCtrlDecoder(nn.Module):
     def predict_masks(
         self,
         image_embedding: Tensor,
+        vit_embedding: Tensor,
         image_pe: Tensor,
         clip_embedding: Tensor,
         clip_pe: Tensor,
-        text_embedding: Tensor
+        text_embedding: Tensor,
+        similarity: Tensor = None,
     ):
+        vit_features = vit_embedding[0].permute(0, 3, 1, 2) # early-layer ViT feature, after 1st global attention block in ViT
+        fusion_features = self.embedding_encoder(image_embedding) + self.compress_vit_feat(vit_features)
+
         # Concatenate output tokens
         output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
         output_tokens = output_tokens.unsqueeze(0).expand(text_embedding.size(0), -1, -1)
@@ -121,9 +153,12 @@ class FGCtrlDecoder(nn.Module):
         
         for block in self.blocks:
             image_embedding, image_pe, clip_embedding, clip_pe, tokens = \
-                block(image_embedding, image_pe, clip_embedding, clip_pe, tokens)
+                block(image_embedding, image_pe, clip_embedding, clip_pe, tokens, similarity)
         iou_token_out = tokens[:, 0, :]
         mask_tokens_out = tokens[:, 1 : (1 + self.num_mask_tokens), :]
+        
+        image_embedding = self.embedding_maskfeature(image_embedding) + fusion_features
+        
         b, c, h, w = image_embedding.shape
         masks = (mask_tokens_out @ image_embedding.view(b, c, h * w)).view(b, -1, h, w)
         
@@ -150,7 +185,7 @@ class FGCtrlBlock(nn.Module):
             n_patches=n_patches,
             embedding_dim=input_dim,
             attention_num_heads=attention_num_heads,
-            downsample_rate=downsample_rate*2,
+            downsample_rate=downsample_rate,
             mlp_ratio=mlp_ratio,
             activation=activation
         )
@@ -177,10 +212,11 @@ class FGCtrlBlock(nn.Module):
         image_pe: Tensor,
         clip_embedding: Tensor,
         clip_pe: Tensor,
-        tokens:Tensor
+        tokens:Tensor,
+        similarity: Tensor = None
     ):
         b, c, h, w = image_embedding.shape
-        image_embedding = self.pca(clip_embedding, image_embedding, clip_pe)
+        image_embedding = self.pca(clip_embedding, image_embedding, clip_pe, similarity)
         tokens, image_embedding = self.transformer(image_embedding, image_pe, tokens)
         return self.upscaling(image_embedding.transpose(1, 2).view(b, c, h, w), image_pe, clip_embedding, clip_pe, tokens)
         
@@ -197,10 +233,12 @@ class PatchCrossAttn(nn.Module):
         ):
         super().__init__()
         self.n_patches = n_patches
-        self.cross_attn_list = nn.ModuleList(
-            [Attention(embedding_dim, attention_num_heads, downsample_rate**2) for i in range(n_patches*n_patches)]
-            )
+        # self.cross_attn_list = nn.ModuleList(
+        #     [Attention(embedding_dim, attention_num_heads, downsample_rate) for i in range(n_patches*n_patches)]
+        #     )
+        self.cross_attn_patch = Attention(embedding_dim, attention_num_heads, downsample_rate)
         self.all_attn = Attention(embedding_dim, attention_num_heads, downsample_rate)
+        self.norm0 = nn.LayerNorm(embedding_dim)
         self.norm1 = nn.LayerNorm(embedding_dim)
         self.norm2 = nn.LayerNorm(embedding_dim)
         self.mlp = MLPBlock(embedding_dim, embedding_dim*mlp_ratio)
@@ -230,35 +268,42 @@ class PatchCrossAttn(nn.Module):
         clip_embedding: Tensor,
         image_embedding: Tensor,
         pos_embedding: Tensor,
+        similarity: Tensor = None,
     ):
         split_embedding = self.split_embed(image_embedding, self.n_patches)
         bs, _, c, h, w = split_embedding.shape
-        
+        pca_outs = []
         for patch_idx in range(self.n_patches * self.n_patches):
             split_patch = split_embedding[:, patch_idx, :, :, :]
             split_patch = (split_patch.permute(0,2,3,1)).view(bs, -1, c)
-            clip_patch = clip_embedding[:, patch_idx, :].unsqueeze(1)
-            pe = pos_embedding[:, patch_idx, :].unsqueeze(1)
-            attn_out = self.cross_attn_list[patch_idx](
+            attn_out = self.cross_attn_patch(
                 q=split_patch,
-                k=clip_patch + pe,
-                v=clip_patch
+                k=clip_embedding[:, :-1, :] + pos_embedding,
+                v=clip_embedding[:, :-1, :]
             )
-            split_embedding[:, patch_idx, :, :, :] += \
-                ((attn_out.view(bs, h, w, c)).permute(0, 3, 1, 2))
+            if similarity is not None:
+                attn_out = \
+                    attn_out * (similarity[:, patch_idx].unsqueeze(1).unsqueeze(2)).expand(-1, attn_out.size(1), attn_out.size(2))
+            # split_embedding[:, patch_idx, :, :, :] += \
+            #     ((attn_out.view(bs, h, w, c)).permute(0, 3, 1, 2))
+            pca_outs.append((attn_out.view(bs, h, w, c)).permute(0, 3, 1, 2))
+        pca_out = torch.stack(pca_outs, dim=1)
+        split_embedding = split_embedding + pca_out
 
         out_embedding = self.merge_embed(split_embedding, self.n_patches)
         
         out_embedding = out_embedding.permute(0, 2, 3, 1).view(bs, -1, c)
-        image_clip = clip_embedding[:, -1, :].unsqueeze(1)
+        out_embedding = self.norm0(out_embedding)
         all_attn_out = self.all_attn(
             q=out_embedding,
-            k=image_clip,
-            v=image_clip
+            k=clip_embedding,
+            v=clip_embedding
         )
-        out_embedding += all_attn_out
+        if similarity is not None:
+            all_attn_out *= \
+                similarity[:, -1].unsqueeze(1).unsqueeze(2).expand(-1, all_attn_out.size(1), all_attn_out.size(2))
         
-        out_embedding = self.norm1(out_embedding)
+        out_embedding = self.norm1(out_embedding + all_attn_out)
         mlp_out = self.mlp(out_embedding)
         out_embedding = self.norm2(out_embedding + mlp_out)
         out_embedding = out_embedding.view(bs, h*self.n_patches, w*self.n_patches, c).permute(0, 3, 1, 2)
@@ -288,13 +333,12 @@ class Upscaling(nn.Module):
                 )
         )
         
-        self.clip_proj = MLP(
-            input_dim=input_dim,
-            hidden_dim=input_dim,
-            output_dim=output_dim,
-            num_layers=3,
-            norm_output=not is_last
+        self.clip_proj = nn.Linear(
+            input_dim,
+            output_dim,
+            bias=False
         )
+        self.clip_norm = nn.LayerNorm(output_dim)
         
         self.token_proj = MLP(
             input_dim=input_dim,
@@ -319,9 +363,9 @@ class Upscaling(nn.Module):
         
         num_embedding = clip_embedding.size(1)
         clip_cat = torch.cat([clip_embedding, clip_pe], dim=1)
-        clip_cat = self.clip_proj(clip_cat)
-        clip_out = clip_cat[: , :num_embedding, :]
-        pe_out = clip_cat[:, num_embedding:, :]
+        clip_p = self.clip_norm(self.clip_proj(clip_cat))
+        clip_out = clip_p[: , :num_embedding, :]
+        pe_out = clip_p[:, num_embedding:, :]
         
         tokens_out = self.token_proj(tokens)
         
@@ -400,8 +444,7 @@ class MultiConvBlock(nn.Module):
         
         self.output = nn.Sequential(
             activation(),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            activation()
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         )
         
         self.shortcut = shortcut

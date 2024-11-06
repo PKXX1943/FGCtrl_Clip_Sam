@@ -8,8 +8,8 @@ __pycache__/
 
 .vscode/
 
-irrelavance/
 data
+prepared
 sam_hq/
 biomed_clip/
 pretrained/

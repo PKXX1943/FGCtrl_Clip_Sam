@@ -37,21 +37,25 @@ class FGCtrlClipSam(nn.Module):
     def forward(
         self,
         batched_input : dict,
+        similarities: bool = True,
         multimask_output: bool = False
     ):
-        image_inputs = self.preprocess(batched_input["image"].to(self.device))
+        # image_inputs = self.preprocess(batched_input["image"].to(self.device))
+        image_inputs = batched_input["image"].to(self.device)
         with torch.no_grad():
-            image_embedding = self.image_encoder(image_inputs)
+            image_embedding, interm_embeddings = self.image_encoder(image_inputs)
         pil_images = batched_input["pil_image"]
         captions = batched_input["caption"]
         n_patches = self.decoder.n_patches
-        clip_embedding, text_embedding, clip_pe = self.clip_encoder(
+        clip_embedding, text_embedding, clip_pe, sim = self.clip_encoder(
             pil_images, captions, n_patches
         )
+        if not similarities:
+            sim = None
         mask_logits, iou_predictions = self.decoder(
-            image_embedding, clip_embedding, clip_pe, text_embedding, multimask_output
+            image_embedding, interm_embeddings, clip_embedding, clip_pe, text_embedding, sim, multimask_output
         )
-        masks = self.postprocess_masks(
+        logits, masks = self.postprocess_masks(
                 mask_logits,
                 input_size=mask_logits.shape[-2:],
                 original_size=batched_input["image"].shape[-2:],
@@ -61,7 +65,7 @@ class FGCtrlClipSam(nn.Module):
         output = {
             "masks": masks,
             "iou_predictions": iou_predictions,
-            "logits": mask_logits
+            "logits": logits
         }
         
         return output
@@ -88,15 +92,20 @@ class FGCtrlClipSam(nn.Module):
           (torch.Tensor): Batched masks in BxCxHxW format, where (H, W)
             is given by original_size.
         """
-        masks = F.interpolate(
-            masks,
-            (self.image_encoder.img_size, self.image_encoder.img_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        masks = masks[..., : input_size[0], : input_size[1]]
-        masks = F.interpolate(masks, original_size, mode="bilinear", align_corners=False)
-        return masks
+        # masks = F.interpolate(
+        #     masks,
+        #     (self.image_encoder.img_size, self.image_encoder.img_size),
+        #     mode="bilinear",
+        #     align_corners=False,
+        # )
+        # masks = masks[..., : input_size[0], : input_size[1]]
+        # mean = masks.mean(dim=(2, 3), keepdim=True)  
+        # masks = masks - mean
+
+        masks_ori = F.interpolate(masks, original_size, mode="bilinear", align_corners=False)
+        # masks = F.relu(masks)
+        # masks_ori = F.relu(masks_ori)
+        return masks, masks_ori
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""

@@ -165,7 +165,6 @@ def loss_masks(src_masks, target_masks, num_masks, oversample_ratio=3.0):
     """
 
     # No need to upsample predictions as we are using normalized coordinates :)
-
     with torch.no_grad():
         # sample point_coords
         point_coords = get_uncertain_point_coords_with_randomness(

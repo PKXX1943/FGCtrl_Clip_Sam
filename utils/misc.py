@@ -275,7 +275,7 @@ def setup_logger(log_file=None, level=logging.INFO):
 
     if log_file is not None:            
         if is_main_process() and not os.path.exists(os.path.dirname(log_file)):
-            os.makedirs(os.path.dirname(log_file))
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)

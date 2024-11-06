@@ -1,14 +1,15 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from PIL import Image
 import cv2
 
 def show_anns(masks, gt_mask, filename, image, ious, boundary_ious):
     if len(masks) == 0:
         return
     for i, (mask, iou, biou) in enumerate(zip(masks, ious, boundary_ious)):
-        # image = cv2.cvtColor((np.array(image)), cv2.COLOR_BGR2GRAY)
-        image = np.array(image)
-        image = np.zeros((image.shape[1], image.shape[2], 3))
+        image = image.resize((1024, 1024), Image.LANCZOS)
+        image = cv2.cvtColor((np.array(image)), cv2.COLOR_BGR2GRAY)
+
         plt.figure(figsize=(10,10))
         plt.imshow(image, cmap='gray')
         show_mask(mask, plt.gca(), 1)
@@ -25,6 +26,5 @@ def show_mask(mask, ax, random_color):
         color = np.array([30/255, 144/255, 255/255, 0.4])
     else:
         color = np.array([255/255, 144/255, 30/255, 0.4])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+    mask_image = mask.reshape(1024, 1024, 1) * color.reshape(1, 1, -1)
     ax.imshow(mask_image)

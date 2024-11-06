@@ -80,6 +80,7 @@ def build_model_laion_clip(
         clip_encoder=ClipEncoder(
             embedding_dim=1280,
             out_dim=256,
+            context_length=77,
             clip_model = 'hf-hub:laion/CLIP-ViT-bigG-14-laion2B-39B-b160k',
             tokenizer = 'hf-hub:laion/CLIP-ViT-bigG-14-laion2B-39B-b160k',
             learnable_pe = True,
