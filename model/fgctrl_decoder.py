@@ -28,14 +28,12 @@ class FGCtrlDecoder(nn.Module):
         
         Args:
           fgctrl_config: a dictionary of configurations for building decoder blocks. keys referrence below:
-                n_patches (int) : the number of patches an image is split on each side
                 input_dim (list[int]) : the channel dimension of the input embeddings of each block
                 output_dim (list[int]) : the channel dimension of the output embeddings of each block
                 transformer_depth (list[int]) : the number of transformer blocks in the transformer structure of each block
                 downsample_rate (list[int]): downsample when doing qkv projection in attention blocks
           input_dim : the channel dimension of the input embeddings of FGCtrlDecoder
           out_dim : the channel dimension of the final embeddings of of FGCtrlDecoder
-          n_patches : to split an image into n * n patches for fine-grained control
           num_multimask_outputs : the number of masks to predict when disambiguating masks
           iou_head_depth : the depth of the MLP used to predict mask quality
           iou_head_hidden_dim : the hidden dimension of the MLP used to predict mask quality
@@ -44,11 +42,11 @@ class FGCtrlDecoder(nn.Module):
         # self.compress_vit_feat = nn.ModuleList([])
         # self.emebedding_encoder = nn.ModuleList([])
         num_blocks = len(fgctrl_config["input_dim"])
-        self.n_patches = fgctrl_config['n_patches']
+        # self.n_patches = fgctrl_config['n_patches']
         for idx in range(num_blocks-1):
             self.blocks.append(
                 FGCtrlBlock(
-                    n_patches=self.n_patches,
+                    # n_patches=self.n_patches,
                     input_dim=fgctrl_config['input_dim'][idx],
                     output_dim=fgctrl_config['output_dim'][idx],
                     transformer_depth=fgctrl_config['transformer_depth'][idx],
@@ -57,7 +55,7 @@ class FGCtrlDecoder(nn.Module):
             )
         self.blocks.append(
             FGCtrlBlock(
-                    n_patches=self.n_patches,
+                    # n_patches=self.n_patches,
                     input_dim=fgctrl_config['input_dim'][-1],
                     output_dim=fgctrl_config['output_dim'][-1],
                     transformer_depth=fgctrl_config['transformer_depth'][-1],
@@ -99,6 +97,7 @@ class FGCtrlDecoder(nn.Module):
 
     def forward(
         self,
+        n_patches: int,
         image_embedding: Tensor,
         vit_embedding: Tensor,
         clip_embedding: Tensor,
@@ -110,6 +109,7 @@ class FGCtrlDecoder(nn.Module):
         image_pe = self.pe_layer((image_embedding.size(2), image_embedding.size(3))).unsqueeze(0)
         
         masks, iou_pred = self.predict_masks(
+            n_patches = n_patches,
             image_embedding=image_embedding,
             vit_embedding = vit_embedding,
             image_pe=image_pe,
@@ -132,6 +132,7 @@ class FGCtrlDecoder(nn.Module):
 
     def predict_masks(
         self,
+        n_patches : int,
         image_embedding: Tensor,
         vit_embedding: Tensor,
         image_pe: Tensor,
@@ -153,7 +154,7 @@ class FGCtrlDecoder(nn.Module):
         
         for block in self.blocks:
             image_embedding, image_pe, clip_embedding, clip_pe, tokens = \
-                block(image_embedding, image_pe, clip_embedding, clip_pe, tokens, similarity)
+                block(n_patches, image_embedding, image_pe, clip_embedding, clip_pe, tokens, similarity)
         iou_token_out = tokens[:, 0, :]
         mask_tokens_out = tokens[:, 1 : (1 + self.num_mask_tokens), :]
         
@@ -173,7 +174,7 @@ class FGCtrlBlock(nn.Module):
         input_dim: int,
         output_dim: int,
         transformer_depth: int,
-        n_patches: int,
+        # n_patches: int,
         downsample_rate: int,
         attention_num_heads: int = 8,
         mlp_ratio: int = 2,
@@ -182,7 +183,7 @@ class FGCtrlBlock(nn.Module):
         ):
         super().__init__()
         self.pca = PatchCrossAttn(
-            n_patches=n_patches,
+            # n_patches=n_patches,
             embedding_dim=input_dim,
             attention_num_heads=attention_num_heads,
             downsample_rate=downsample_rate,
@@ -208,6 +209,7 @@ class FGCtrlBlock(nn.Module):
     
     def forward(
         self,
+        n_patches: int,
         image_embedding: Tensor,
         image_pe: Tensor,
         clip_embedding: Tensor,
@@ -216,7 +218,7 @@ class FGCtrlBlock(nn.Module):
         similarity: Tensor = None
     ):
         b, c, h, w = image_embedding.shape
-        image_embedding = self.pca(clip_embedding, image_embedding, clip_pe, similarity)
+        image_embedding = self.pca(n_patches, clip_embedding, image_embedding, clip_pe, image_pe, similarity)
         tokens, image_embedding = self.transformer(image_embedding, image_pe, tokens)
         return self.upscaling(image_embedding.transpose(1, 2).view(b, c, h, w), image_pe, clip_embedding, clip_pe, tokens)
         
@@ -224,7 +226,7 @@ class FGCtrlBlock(nn.Module):
 class PatchCrossAttn(nn.Module):
     def __init__(
         self,
-        n_patches: int,
+        # n_patches: int,
         embedding_dim: int,
         attention_num_heads: int,
         downsample_rate: int = 2,
@@ -232,7 +234,7 @@ class PatchCrossAttn(nn.Module):
         activation: Type[nn.Module] = nn.SELU,
         ):
         super().__init__()
-        self.n_patches = n_patches
+        # self.n_patches = n_patches
         # self.cross_attn_list = nn.ModuleList(
         #     [Attention(embedding_dim, attention_num_heads, downsample_rate) for i in range(n_patches*n_patches)]
         #     )
@@ -265,32 +267,35 @@ class PatchCrossAttn(nn.Module):
         
     def forward(
         self,
+        n_patches: int,
         clip_embedding: Tensor,
         image_embedding: Tensor,
         pos_embedding: Tensor,
+        image_pos_embedding: Tensor,
         similarity: Tensor = None,
     ):
-        split_embedding = self.split_embed(image_embedding, self.n_patches)
+        split_embedding = self.split_embed(image_embedding, n_patches)
         bs, _, c, h, w = split_embedding.shape
         pca_outs = []
-        for patch_idx in range(self.n_patches * self.n_patches):
+        for patch_idx in range(n_patches * n_patches):
             split_patch = split_embedding[:, patch_idx, :, :, :]
+            split_pe = image_pos_embedding[:, patch_idx, :, :, :]
             split_patch = (split_patch.permute(0,2,3,1)).view(bs, -1, c)
+            split_pe = (split_pe.permute(0,2,3,1)).view(bs, -1, c)
             attn_out = self.cross_attn_patch(
-                q=split_patch,
+                q=split_patch+split_pe,
                 k=clip_embedding[:, :-1, :] + pos_embedding,
                 v=clip_embedding[:, :-1, :]
             )
             if similarity is not None:
                 attn_out = \
                     attn_out * (similarity[:, patch_idx].unsqueeze(1).unsqueeze(2)).expand(-1, attn_out.size(1), attn_out.size(2))
-            # split_embedding[:, patch_idx, :, :, :] += \
-            #     ((attn_out.view(bs, h, w, c)).permute(0, 3, 1, 2))
+
             pca_outs.append((attn_out.view(bs, h, w, c)).permute(0, 3, 1, 2))
         pca_out = torch.stack(pca_outs, dim=1)
         split_embedding = split_embedding + pca_out
 
-        out_embedding = self.merge_embed(split_embedding, self.n_patches)
+        out_embedding = self.merge_embed(split_embedding, n_patches)
         
         out_embedding = out_embedding.permute(0, 2, 3, 1).view(bs, -1, c)
         out_embedding = self.norm0(out_embedding)
@@ -306,7 +311,7 @@ class PatchCrossAttn(nn.Module):
         out_embedding = self.norm1(out_embedding + all_attn_out)
         mlp_out = self.mlp(out_embedding)
         out_embedding = self.norm2(out_embedding + mlp_out)
-        out_embedding = out_embedding.view(bs, h*self.n_patches, w*self.n_patches, c).permute(0, 3, 1, 2)
+        out_embedding = out_embedding.view(bs, h*n_patches, w*n_patches, c).permute(0, 3, 1, 2)
         
         return out_embedding
         

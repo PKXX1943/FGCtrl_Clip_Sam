@@ -5,6 +5,9 @@ __pycache__/
 *.DS_Store
 *._*
 *.egg
+*.tar
+*.zip
+*.tar.gz
 
 .vscode/
 

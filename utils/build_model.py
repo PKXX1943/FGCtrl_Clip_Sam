@@ -6,21 +6,21 @@ from segment_anything import sam_model_registry
 
 model_type_dict = {
     "4patches_256": {
-        "n_patches" : 4,
+        # "n_patches" : 4,
         "input_dim" : [256, 64],
         "output_dim" : [64, 32],
         "transformer_depth" : [2, 2],
         "downsample_rate": [2, 1]
     },
     "2patches_256": {
-        "n_patches" : 2,
+        # "n_patches" : 2,
         "input_dim" : [256, 64],
         "output_dim" : [64, 32],
         "transformer_depth" : [2, 2],
         "downsample_rate": [2, 1]
     },
     "4patches_512": {
-        "n_patches" : 4,
+        # "n_patches" : 4,
         "input_dim" : [256, 128, 64],
         "output_dim" : [128, 64, 32],
         "transformer_depth" : [2, 1, 1],

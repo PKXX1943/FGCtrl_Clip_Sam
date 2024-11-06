@@ -34,6 +34,7 @@ def get_args_parser():
     parser.add_argument("--device", type=str, default="cuda", 
                         help="The device to run generation on.")
 
+    parser.add_argument('--n_patches', default=4, type=int)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--learning_rate', default=1e-3, type=float)
     parser.add_argument('--start_epoch', default=0, type=int)
@@ -114,7 +115,7 @@ def train(train_data, val_data, model, args, logger):
 
         for data in metric_logger.log_every(train_dataloaders, args.log_freq, logger=logger):
             output = model(
-                batched_input=data, similarities=args.similarities, multimask_output=False
+                batched_input=data, n_patches = args.n_patches, similarities=args.similarities, multimask_output=False
             )
             mask_logits = output["logits"]
             labels = data['label'].to(mask_logits.device)
