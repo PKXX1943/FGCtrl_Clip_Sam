@@ -155,6 +155,34 @@ class ClipEncoder(nn.Module):
                 blocks.append(block)
         return blocks
     
+    def get_masked(self, image: Image, n_patches: int):
+        # mask different region of an image
+        assert n_patches in [2**k for k in range(1, 7)], f"n_patches must equal 2 ^ k where k = 1,2,3,4,5,6."
+        width, height = image.size
+        block_size = width // n_patches
+        image_np = np.array(image)
+        blocks = []
+        for center_i in range(n_patches):
+            for center_j in range(n_patches):
+                modified_image_np = np.zeros_like(image_np)            
+                for i in range(n_patches):
+                    for j in range(n_patches):
+                        top_left_x = j * block_size
+                        top_left_y = i * block_size
+                        bottom_right_x = (j + 1) * block_size
+                        bottom_right_y = (i + 1) * block_size
+                        if i == center_i and j == center_j:
+                            modified_image_np[
+                                top_left_y:bottom_right_y, top_left_x:bottom_right_x] = \
+                                    image_np[top_left_y:bottom_right_y, top_left_x:bottom_right_x]
+                        elif (i > 0 and i < n_patches-1) and (j > 0 and j < n_patches-1):
+                            modified_image_np[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = \
+                                np.clip(image_np[top_left_y:bottom_right_y, top_left_x:bottom_right_x] * 0.5, 0, 255)
+                        else:
+                            modified_image_np[top_left_y:bottom_right_y, top_left_x:bottom_right_x] = 0
+                blocks.append(Image.fromarray(modified_image_np.astype(np.uint8)))
+        return blocks
+    
     def resize_image(self, image, target_size=(1024, 1024)):
         # resize method that is consistent with dataset transforms
         transform_to_tensor = T.ToTensor()  
@@ -182,17 +210,23 @@ class ClipEncoder(nn.Module):
         images = []
         captions = []
         for image, caption in zip(batch_images, batch_captions):
-            images.extend(self.get_patches(self.resize_image(image, target_size), n_patches))
-            captions.extend([caption] * (n_patches*n_patches + 1))
+            # images.extend(self.get_patches(self.resize_image(image, target_size), n_patches))
+            images.extend(self.get_masked(self.resize_image(image, target_size), n_patches))
+            # captions.extend([caption] * (n_patches*n_patches + 1))
+            captions.append(caption)
             images.append(self.resize_image(image, target_size))
         image_tensor = torch.stack([self.preprocess(img) for img in images]).to(self.device)
         text_tensor = self.tokenizer(captions, context_length=self.context_length).to(self.device)
         with torch.no_grad():
-            image_embedding, text_embedding, _ = self.model(image_tensor, text_tensor)
-        sim = self.cal_similarities(image_embedding, text_embedding[0])
+            # image_embedding, text_embedding, _ = self.model(image_tensor, text_tensor)
+            image_embedding = self.model.encode_image(image_tensor)
+            text_embedding = self.model.encode_text(text_tensor)
+        image_embedding = image_embedding.view(bs, n_patches*n_patches+1, -1)
+        text_embedding = text_embedding.view(bs, -1)
+        sim = torch.stack([self.cal_similarities(image_embedding[i], text_embedding[i]) for i in range(bs)])
         sim = sim.view(bs, n_patches*n_patches+1)
         image_embedding = image_embedding.view(bs, n_patches*n_patches+1, -1)
-        text_embedding = text_embedding.view(bs, n_patches*n_patches+1, -1)
+        text_embedding = text_embedding.view(bs, -1)
         img_out, text_out, pe = self.head(n_patches, image_embedding, text_embedding[:, :self.num_text_embeddings, :])
         return img_out, text_out, pe, sim
 
