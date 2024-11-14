@@ -284,13 +284,9 @@ class PatchCrossAttn(nn.Module):
             split_pe = (split_pe.permute(0,2,3,1)).view(bs, -1, c)
             attn_out = self.cross_attn_patch(
                 q=split_patch+split_pe,
-                k=clip_embedding[:, :-1, :] + pos_embedding,
-                v=clip_embedding[:, :-1, :]
+                k=clip_embedding[:, patch_idx, :, :] + pos_embedding[:, [patch_idx], :],
+                v=clip_embedding[:, patch_idx, :, :]
             )
-            if similarity is not None:
-                attn_out = \
-                    attn_out * (similarity[:, patch_idx].unsqueeze(1).unsqueeze(2)).expand(-1, attn_out.size(1), attn_out.size(2))
-
             pca_outs.append((attn_out.view(bs, h, w, c)).permute(0, 3, 1, 2))
         pca_out = torch.stack(pca_outs, dim=1)
         split_embedding = split_embedding + pca_out
@@ -301,12 +297,9 @@ class PatchCrossAttn(nn.Module):
         out_embedding = self.norm0(out_embedding)
         all_attn_out = self.all_attn(
             q=out_embedding,
-            k=clip_embedding,
-            v=clip_embedding
+            k=clip_embedding[:, -1, :, :],
+            v=clip_embedding[:, -1, :, :]
         )
-        if similarity is not None:
-            all_attn_out *= \
-                similarity[:, -1].unsqueeze(1).unsqueeze(2).expand(-1, all_attn_out.size(1), all_attn_out.size(2))
         
         out_embedding = self.norm1(out_embedding + all_attn_out)
         mlp_out = self.mlp(out_embedding)
@@ -326,16 +319,17 @@ class Upscaling(nn.Module):
         super().__init__()
         
         self.image_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(input_dim*2, input_dim // 2, kernel_size=2, stride=2),
+            nn.ConvTranspose2d(input_dim*2, input_dim, kernel_size=2, stride=2),
             LayerNorm2d(input_dim // 2),
             activation(),
-            MultiConvBlock(
-                input_dim//2, 
-                output_dim*2, 
-                activation, 
-                shortcut=nn.Conv2d(input_dim//2, output_dim*2, kernel_size=1, bias=False),
-                norm_output=not is_last
-                )
+            # MultiConvBlock(
+            #     input_dim//2, 
+            #     output_dim*2, 
+            #     activation, 
+            #     shortcut=nn.Conv2d(input_dim//2, output_dim*2, kernel_size=1, bias=False),
+            #     norm_output=not is_last
+            #     )
+            nn.ConvTranspose2d(input_dim, output_dim*2, kernel_size=2, stride=2),
         )
         
         self.clip_proj = nn.Linear(

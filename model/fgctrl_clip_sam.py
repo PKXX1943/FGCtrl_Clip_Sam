@@ -47,7 +47,7 @@ class FGCtrlClipSam(nn.Module):
             image_embedding, interm_embeddings = self.image_encoder(image_inputs)
         pil_images = batched_input["pil_image"]
         captions = batched_input["caption"]
-        clip_embedding, text_embedding, clip_pe, sim = self.clip_encoder(
+        clip_embedding, _, text_embedding, clip_pe, sim = self.clip_encoder(
             pil_images, captions, n_patches
         )
         if not similarities:

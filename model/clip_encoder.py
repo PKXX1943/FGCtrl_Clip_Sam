@@ -7,6 +7,7 @@ from PIL import Image
 import math
 import numpy as np
 from open_clip import create_model_from_pretrained, get_tokenizer
+from open_clip.model import VisionTransformer
 
 # lightly adapte from segment_anything/modeling/prompt_encoder.py
 class PositionEmbeddingRandom(nn.Module):
@@ -51,6 +52,58 @@ class PositionEmbeddingRandom(nn.Module):
 
         return pe.view(-1, self.embedding_dim)
 
+class ClipViT_interm(VisionTransformer):
+    '''
+    This class is basically the same as the VisionTransformer class from open_clip.model, 
+    with an extra output of the interm embeddings before the global pooling.
+    '''
+    def forward(self, x: torch.Tensor):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+        # class embeddings and positional embeddings
+        x = torch.cat([self.class_embedding.view(1, 1, -1).expand(x.shape[0], -1, -1).to(x.dtype), x], dim=1)
+        # shape = [*, grid ** 2 + 1, width]
+        x = x + self.positional_embedding.to(x.dtype)
+
+        x = self.patch_dropout(x)
+        x = self.ln_pre(x)
+        x = self.transformer(x)
+
+        if self.attn_pool is not None:
+            if self.attn_pool_contrastive is not None:
+                # This is untested, WIP pooling that should match paper
+                x = self.ln_post(x)  # TBD LN first or separate one after each pool?
+                interm_embeddings = x
+                tokens = self.attn_pool(x)
+                if self.attn_pool_type == 'parallel':
+                    pooled = self.attn_pool_contrastive(x)
+                else:
+                    assert self.attn_pool_type == 'cascade'
+                    pooled = self.attn_pool_contrastive(tokens)
+            else:
+                # this is the original OpenCLIP CoCa setup, does not match paper
+                x = self.attn_pool(x)
+                x = self.ln_post(x)
+                interm_embeddings = x
+                pooled, tokens = self._global_pool(x)
+        elif self.final_ln_after_pool:
+            interm_embeddings = x
+            pooled, tokens = self._global_pool(x)
+            pooled = self.ln_post(pooled)
+        else:
+            x = self.ln_post(x)
+            interm_embeddings = x
+            pooled, tokens = self._global_pool(x)
+
+        if self.proj is not None:
+            pooled = pooled @ self.proj
+
+        if self.output_tokens:
+            return pooled, interm_embeddings, tokens
+        
+        return pooled, interm_embeddings
 
 class ClipHead(nn.Module):
     def __init__(
@@ -64,10 +117,11 @@ class ClipHead(nn.Module):
         super().__init__()
         self.pos_embed = PositionEmbeddingRandom(out_dim//2,)
         self.lin1_img = nn.Linear(embedding_dim, out_dim)
-        # self.lin2_img = nn.Linear(mlp_dim, out_dim)
+        self.lin1_img_pooled = nn.Linear(embedding_dim, out_dim)
         self.lin1_text = nn.Linear(embedding_dim, out_dim)
-        # self.lin2_text = nn.Linear(mlp_dim, out_dim)
-        self.norm =nn.LayerNorm(out_dim)
+        self.norm_pooled =nn.LayerNorm(out_dim)
+        self.norm_img =nn.LayerNorm(out_dim)
+        self.norm_text =nn.LayerNorm(out_dim)
         self.act = act()
         self.learnable_pe = learnable_pe
         
@@ -87,17 +141,17 @@ class ClipHead(nn.Module):
     def forward(
         self,
         n_patches: int,
+        pooled: torch.Tensor,
         image_embedding: torch.Tensor,
         text_embedding: torch.Tensor
         ):
         bs = image_embedding.size(0)
         pe = self.pos_embed(n_patches)
-        # img_out = self.norm(self.lin2_img(self.act(self.lin1_img(image_embedding))))
-        # text_out = self.norm(self.lin2_text(self.act(self.lin1_text(text_embedding))))
-        img_out = self.norm(self.lin1_img(image_embedding))
-        text_out = self.norm(self.lin1_text(text_embedding))
+        img_out = self.norm_pooled(self.lin1_img_pooled(pooled))
+        text_out = self.norm_text(self.lin1_text(text_embedding))
+        img_embedding = self.norm_img(self.lin1_img(image_embedding))
         
-        return img_out, text_out, pe.unsqueeze(0).expand(img_out.size(0), -1, -1)
+        return img_embedding, img_out, text_out, pe.unsqueeze(0).expand(img_out.size(0), -1, -1)
         
 
 class ClipEncoder(nn.Module):
@@ -109,7 +163,6 @@ class ClipEncoder(nn.Module):
         tokenizer: str = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
         context_length : int = 256,
         learnable_pe: bool = True,
-        num_text_embeddings: int = 1
     ):
         """
         Biomed-clip inference model to generate clip features for image patches and caption. Using linear head 
@@ -126,6 +179,7 @@ class ClipEncoder(nn.Module):
         super().__init__()
         
         self.model, self.preprocess = create_model_from_pretrained(clip_model)
+        self.model.visual = ClipViT_interm(**self.model.visual.__dict__) 
         self.tokenizer = get_tokenizer(tokenizer)
         self.context_length = context_length
         self.head = ClipHead(
@@ -135,16 +189,25 @@ class ClipEncoder(nn.Module):
             learnable_pe=learnable_pe,
         )
         self.model.eval()
-        self.num_text_embeddings = num_text_embeddings
         
     @property
     def device(self):
         return next(self.parameters()).device
 
-        
-    def get_patches(self, image:Image, n_patches):  
+    def auto_patch(self, size):
+        resolution, _ = size
+        if resolution < 256:
+            return 0
+        elif resolution < 512:
+            return 1
+        else:
+            return 2
+
+    def get_patches(self, image:Image, n_patches=None):  
         # split an image into patches   
-        assert n_patches in [2**k for k in range(1, 7)], f"n_patches must eqaul 2 ^ k while k=1,2,3,4,5,6."
+        if n_patches is None:
+            n_patches = self.auto_patch(image.size)
+        assert n_patches in [2**k for k in range(0, 5)], f"n_patches must eqaul 2 ^ k while k=0,1,2,3,4."
         width, height = image.size
         block_size = width // n_patches
         blocks = []
@@ -157,7 +220,7 @@ class ClipEncoder(nn.Module):
     
     def get_masked(self, image: Image, n_patches: int):
         # mask different region of an image
-        assert n_patches in [2**k for k in range(1, 7)], f"n_patches must equal 2 ^ k where k = 1,2,3,4,5,6."
+        assert n_patches in [2**k for k in range(1, 7)], f"n_patches must equal 2 ^ k where k = 0,1,2,3,4,5,6."
         width, height = image.size
         block_size = width // n_patches
         image_np = np.array(image)
@@ -183,12 +246,12 @@ class ClipEncoder(nn.Module):
                 blocks.append(Image.fromarray(modified_image_np.astype(np.uint8)))
         return blocks
     
-    def resize_image(self, image, target_size=(1024, 1024)):
+    def resize_image(self, image, target_size=1024):
         # resize method that is consistent with dataset transforms
         transform_to_tensor = T.ToTensor()  
         image_tensor = transform_to_tensor(image).unsqueeze(0)  
         
-        resized_tensor = F.interpolate(image_tensor, size=target_size, mode='bilinear')
+        resized_tensor = F.interpolate(image_tensor, size=(target_size, target_size), mode='bilinear')
         
         transform_to_pil = T.ToPILImage()  
         resized_image = transform_to_pil(resized_tensor.squeeze(0))  
@@ -203,32 +266,29 @@ class ClipEncoder(nn.Module):
         batch_images: list,
         batch_captions: list,
         n_patches: int = 4,
-        target_size: Tuple = (1024, 1024),
         ):
         assert len(batch_captions) == len(batch_images)
         bs = len(batch_images)
+        caption_length = len(batch_captions[0].split('\n'))
         images = []
         captions = []
         for image, caption in zip(batch_images, batch_captions):
-            # images.extend(self.get_patches(self.resize_image(image, target_size), n_patches))
-            images.extend(self.get_masked(self.resize_image(image, target_size), n_patches))
-            # captions.extend([caption] * (n_patches*n_patches + 1))
-            captions.append(caption)
+            target_size = max(image.size)
+            images.extend(self.get_patches(self.resize_image(image, target_size), n_patches))
+            # images.extend(self.get_masked(self.resize_image(image, target_size), n_patches))
+            captions.extend(caption.strip().split('\n'))
             images.append(self.resize_image(image, target_size))
         image_tensor = torch.stack([self.preprocess(img) for img in images]).to(self.device)
         text_tensor = self.tokenizer(captions, context_length=self.context_length).to(self.device)
         with torch.no_grad():
-            # image_embedding, text_embedding, _ = self.model(image_tensor, text_tensor)
-            image_embedding = self.model.encode_image(image_tensor)
+            pooled, image_embedding = self.model.visual(image_tensor)
             text_embedding = self.model.encode_text(text_tensor)
-        image_embedding = image_embedding.view(bs, n_patches*n_patches+1, -1)
-        text_embedding = text_embedding.view(bs, -1)
-        sim = torch.stack([self.cal_similarities(image_embedding[i], text_embedding[i]) for i in range(bs)])
-        sim = sim.view(bs, n_patches*n_patches+1)
-        image_embedding = image_embedding.view(bs, n_patches*n_patches+1, -1)
-        text_embedding = text_embedding.view(bs, -1)
-        img_out, text_out, pe = self.head(n_patches, image_embedding, text_embedding[:, :self.num_text_embeddings, :])
-        return img_out, text_out, pe, sim
+        pooled = pooled.view(bs, n_patches*n_patches+1, -1)
+        image_embedding = image_embedding.view(bs, n_patches*n_patches+1, image_embedding.shape[-2], image_embedding.shape[-1])
+        text_embedding = text_embedding.view(bs, caption_length, -1)
+        img_embedding, img_out, text_out, pe = self.head(n_patches, pooled, image_embedding, text_embedding)
+
+        return img_embedding, img_out, text_out, pe
 
         
         
