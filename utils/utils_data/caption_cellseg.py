@@ -25,7 +25,7 @@ class CellAnalyzer:
         return str(base64.b64encode(buffered.getvalue()).decode('utf-8'))
 
     def resize_image_if_needed(self, img):
-        max_dimension = 160
+        max_dimension = 196
         width, height = img.size
         if width > max_dimension or height > max_dimension:
             if width > height:
@@ -53,8 +53,10 @@ class CellAnalyzer:
 
             # Extract the mask region
             img_array = np.array(img)
-            masked_image = Image.fromarray(np.uint8(img_array * mask_region[:, :, np.newaxis]))  # Apply mask to the image
-            unmasked_image = Image.fromarray(np.uint8(img_array * (1 - mask_region[:, :, None])))  # Image without mask
+            if len(img_array.shape) == 2:
+                img_array = np.stack([img_array, img_array, img_array], axis=-1)
+            masked_image = Image.fromarray(np.uint8(img_array * mask_region[:,:,np.newaxis]))  # Apply mask to the image
+            unmasked_image = Image.fromarray(np.uint8(img_array * (1 - mask_region[:,:,None])))  # Image without mask
 
             # Convert masked and unmasked images to base64 for GPT analysis
             base64_masked_image = self.encode_pil_image_to_base64(masked_image)
@@ -124,8 +126,11 @@ class CellAnalyzer:
 def process_image_data(image_path, mask_path, analyzer):
     img = Image.open(image_path)
     mask = Image.open(mask_path) if os.path.exists(mask_path) else None
-    analysis_result = analyzer.analyze_cells(img, mask)
-    
+    try:
+        analysis_result = analyzer.analyze_cells(img, mask)
+    except Exception as e:
+        print(f"Error while processing image: {e}")
+        return None
     result = {
         'image_path': image_path,
         'mask_path': mask_path if mask else None,
@@ -133,11 +138,13 @@ def process_image_data(image_path, mask_path, analyzer):
     }
     return result
 
-def process_batch(batch, analyzer):
+def process_batch(batch, analyzer, pbar):
     results = []
     for image_path, mask_path in batch:
         result = process_image_data(image_path, mask_path, analyzer)
-        results.append(result)
+        if result is not None:
+            results.append(result)
+        pbar.update(1)
     return results
 
 def save_results(results, output_file):
@@ -156,9 +163,9 @@ def chunk_data(data, num_threads):
 
 def main():
     # Set image and mask folder paths
-    image_folder = '/mnt2/pengkaixin/data/cellseg/Tuning/images'
-    mask_folder = '/mnt2/pengkaixin/data/cellseg/Tuning/labels'
-    output_file = 'cellseg_annotations.json'
+    image_folder = 'data/Tuning/images'
+    mask_folder = 'data/Tuning/labels'
+    output_file = 'data/annotations/tuning.json'
 
     # Initialize the analyzer
     analyzer = CellAnalyzer(openai_api_key="hk-rheyva100004661330ee0aeabe882b1448211555c790a6e9")  # Add actual API key
@@ -171,19 +178,20 @@ def main():
     data = [(image_paths[i], mask_paths[i]) for i in range(len(image_paths))]
 
     # Get number of threads (default is 4)
-    num_threads = 1  # You can adjust this value
+    num_threads = 10   # You can adjust this value
 
     # Create batches based on the number of threads
-    batches = chunk_data(data[4:5], num_threads)
+    batches = chunk_data(data, num_threads)
 
     # Use ThreadPoolExecutor to process batches in parallel with tqdm progress bar
     all_results = []
+    pbar = tqdm(total=len(data), desc="Processing images")
     with ThreadPoolExecutor(max_workers=num_threads) as executor:
         futures = []
         for batch in batches:
-            futures.append(executor.submit(process_batch, batch, analyzer))
+            futures.append(executor.submit(process_batch, batch, analyzer, pbar))
 
-        for future in tqdm(futures, desc="Processing batches", total=len(batches)):
+        for future in futures:
             all_results.extend(future.result())
 
     # Save all results to the output JSON file

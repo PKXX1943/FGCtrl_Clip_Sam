@@ -8,6 +8,7 @@ import cv2
 from PIL import Image
 import os
 from glob import glob
+import json
 
 import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, RandomSampler, BatchSampler
@@ -28,26 +29,43 @@ def get_data_dict(annotations, shuffle=True, logger=None):
     data_dict = []
     for i, annotation in enumerate(annotations):
         with open(annotation, 'r') as f:
-            data = f.readlines()
-            dataset_name = data[0].strip()
-            if misc.is_main_process():
-                print_func(f"--->>> Dataset[{i}]  {dataset_name} <<<---")
-            tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
-            for line in data[1:]:
-                tmp_im_list.append(line.split(' | ')[0])
-                tmp_gt_list.append(line.split(' | ')[1])
-                tmp_caption_list.append(line.split(' | ')[2].strip())
-            if shuffle:
-                combined = list(zip(tmp_im_list, tmp_gt_list, tmp_caption_list))
-                random.shuffle(combined)
-                shuffled1, shuffled2, shuffled3 = zip(*combined)
-                tmp_im_list = list(shuffled1)
-                tmp_gt_list = list(shuffled2)
-                tmp_caption_list = list(shuffled3)
-            data_dict.append({"dataset_name": dataset_name,
-                                "img_path":tmp_im_list,
-                                "gt_path":tmp_gt_list,
-                                "caption":tmp_caption_list})
+            if annotation.endswith('.txt'):
+                data = f.readlines()
+                dataset_name = data[0].strip()
+                if misc.is_main_process():
+                    print_func(f"--->>> Dataset[{i}]  {dataset_name} <<<---")
+                tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
+                for line in data[1:]:
+                    tmp_im_list.append(line.split(' | ')[0])
+                    tmp_gt_list.append(line.split(' | ')[1])
+                    tmp_caption_list.append(line.split(' | ')[2].strip())
+                if shuffle:
+                    combined = list(zip(tmp_im_list, tmp_gt_list, tmp_caption_list))
+                    random.shuffle(combined)
+                    shuffled1, shuffled2, shuffled3 = zip(*combined)
+                    tmp_im_list = list(shuffled1)
+                    tmp_gt_list = list(shuffled2)
+                    tmp_caption_list = list(shuffled3)
+                data_dict.append({"dataset_name": dataset_name,
+                                    "img_path":tmp_im_list,
+                                    "gt_path":tmp_gt_list,
+                                    "caption":tmp_caption_list})
+            elif annotation.endswith('.json'):
+                data = json.load(f)
+                dataset_name = annotation.split('/')[-1].split('.')[0]
+                for item in data:
+                    if misc.is_main_process():
+                        print_func(f"----->>> Dataset[{i}]  {dataset_name} <<<---")
+                    tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
+                    for item in data:
+                        tmp_im_list.append(item['image_path'])
+                        tmp_gt_list.append(item['mask_path'])
+                        caption = '\n'.join([val for val in item['analysis_result'].values()])
+                        tmp_caption_list.append(caption)
+                    data_dict.append({"dataset_name": dataset_name,
+                                      "img_path":tmp_im_list,
+                                      "gt_path":tmp_gt_list,
+                                      "caption":tmp_caption_list})
             if misc.is_main_process():
                 print_func(f"dataset length: {len(data_dict[-1]['img_path'])}")
 
@@ -273,10 +291,8 @@ class MyDataset(Dataset):
         
         if self.transform:
             sample = self.transform(sample)
-            
-        pil_image = Image.fromarray(im)
 
-        sample["pil_image"] = pil_image
+        sample["pil_image"] = im
         sample["caption"] = caption
         sample["ori_label"] = gt.type(torch.uint8)  
         # sample['ori_img_path'] = self.dataset["img_path"][idx]

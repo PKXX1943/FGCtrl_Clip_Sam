@@ -7,7 +7,7 @@ from PIL import Image
 import math
 import numpy as np
 from open_clip import create_model_from_pretrained, get_tokenizer
-from open_clip.model import VisionTransformer
+from open_clip.model import VisionTransformer, TimmModel
 
 # lightly adapte from segment_anything/modeling/prompt_encoder.py
 class PositionEmbeddingRandom(nn.Module):
@@ -52,58 +52,59 @@ class PositionEmbeddingRandom(nn.Module):
 
         return pe.view(-1, self.embedding_dim)
 
-class ClipViT_interm(VisionTransformer):
-    '''
-    This class is basically the same as the VisionTransformer class from open_clip.model, 
-    with an extra output of the interm embeddings before the global pooling.
-    '''
-    def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+# class ClipViT_interm(VisionTransformer):
+#     '''
+#     This class is basically the same as the VisionTransformer class from open_clip.model, 
+#     with an extra output of the interm embeddings before the global pooling.
+#     '''
+#     def forward(self, x: torch.Tensor):
+#         width, grid = x.shape[1:3]
+#         x = self.conv1(x)  # shape = [*, width, grid, grid]
+#         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+#         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
 
-        # class embeddings and positional embeddings
-        x = torch.cat([self.class_embedding.view(1, 1, -1).expand(x.shape[0], -1, -1).to(x.dtype), x], dim=1)
-        # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+#         # class embeddings and positional embeddings
+#         x = torch.cat([self.class_embedding.view(1, 1, -1).expand(x.shape[0], -1, -1).to(x.dtype), x], dim=1)
+#         # shape = [*, grid ** 2 + 1, width]
+#         x = x + self.positional_embedding.to(x.dtype)
 
-        x = self.patch_dropout(x)
-        x = self.ln_pre(x)
-        x = self.transformer(x)
+#         x = self.patch_dropout(x)
+#         x = self.ln_pre(x)
+#         x = self.transformer(x)
 
-        if self.attn_pool is not None:
-            if self.attn_pool_contrastive is not None:
-                # This is untested, WIP pooling that should match paper
-                x = self.ln_post(x)  # TBD LN first or separate one after each pool?
-                interm_embeddings = x
-                tokens = self.attn_pool(x)
-                if self.attn_pool_type == 'parallel':
-                    pooled = self.attn_pool_contrastive(x)
-                else:
-                    assert self.attn_pool_type == 'cascade'
-                    pooled = self.attn_pool_contrastive(tokens)
-            else:
-                # this is the original OpenCLIP CoCa setup, does not match paper
-                x = self.attn_pool(x)
-                x = self.ln_post(x)
-                interm_embeddings = x
-                pooled, tokens = self._global_pool(x)
-        elif self.final_ln_after_pool:
-            interm_embeddings = x
-            pooled, tokens = self._global_pool(x)
-            pooled = self.ln_post(pooled)
-        else:
-            x = self.ln_post(x)
-            interm_embeddings = x
-            pooled, tokens = self._global_pool(x)
+#         if self.attn_pool is not None:
+#             if self.attn_pool_contrastive is not None:
+#                 # This is untested, WIP pooling that should match paper
+#                 x = self.ln_post(x)  # TBD LN first or separate one after each pool?
+#                 interm_embeddings = x
+#                 tokens = self.attn_pool(x)
+#                 if self.attn_pool_type == 'parallel':
+#                     pooled = self.attn_pool_contrastive(x)
+#                 else:
+#                     assert self.attn_pool_type == 'cascade'
+#                     pooled = self.attn_pool_contrastive(tokens)
+#             else:
+#                 # this is the original OpenCLIP CoCa setup, does not match paper
+#                 x = self.attn_pool(x)
+#                 x = self.ln_post(x)
+#                 interm_embeddings = x
+#                 pooled, tokens = self._global_pool(x)
+#         elif self.final_ln_after_pool:
+#             interm_embeddings = x
+#             pooled, tokens = self._global_pool(x)
+#             pooled = self.ln_post(pooled)
+#         else:
+#             x = self.ln_post(x)
+#             interm_embeddings = x
+#             pooled, tokens = self._global_pool(x)
 
-        if self.proj is not None:
-            pooled = pooled @ self.proj
+#         if self.proj is not None:
+#             pooled = pooled @ self.proj
 
-        if self.output_tokens:
-            return pooled, interm_embeddings, tokens
+#         if self.output_tokens:
+#             return pooled, interm_embeddings, tokens
         
-        return pooled, interm_embeddings
+#         return pooled, interm_embeddings
 
 class ClipHead(nn.Module):
     def __init__(
@@ -152,7 +153,6 @@ class ClipHead(nn.Module):
         img_embedding = self.norm_img(self.lin1_img(image_embedding))
         
         return img_embedding, img_out, text_out, pe.unsqueeze(0).expand(img_out.size(0), -1, -1)
-        
 
 class ClipEncoder(nn.Module):
     def __init__(
@@ -179,7 +179,7 @@ class ClipEncoder(nn.Module):
         super().__init__()
         
         self.model, self.preprocess = create_model_from_pretrained(clip_model)
-        self.model.visual = ClipViT_interm(**self.model.visual.__dict__) 
+        # self.model.visual = ClipTimm_interm(**self.model.visual.__dict__) 
         self.tokenizer = get_tokenizer(tokenizer)
         self.context_length = context_length
         self.head = ClipHead(
@@ -188,11 +188,15 @@ class ClipEncoder(nn.Module):
             out_dim=out_dim,
             learnable_pe=learnable_pe,
         )
+        self.interm_embeddings = None
         self.model.eval()
         
     @property
     def device(self):
         return next(self.parameters()).device
+    
+    def hook_fn(self, moudle, input, output):
+        self.interm_embeddings = output
 
     def auto_patch(self, size):
         resolution, _ = size
@@ -274,17 +278,20 @@ class ClipEncoder(nn.Module):
         captions = []
         for image, caption in zip(batch_images, batch_captions):
             target_size = max(image.size)
-            images.extend(self.get_patches(self.resize_image(image, target_size), n_patches))
+            images.extend(self.get_patches(self.resize_image(Image.fromarray(image), target_size), n_patches))
             # images.extend(self.get_masked(self.resize_image(image, target_size), n_patches))
             captions.extend(caption.strip().split('\n'))
             images.append(self.resize_image(image, target_size))
         image_tensor = torch.stack([self.preprocess(img) for img in images]).to(self.device)
         text_tensor = self.tokenizer(captions, context_length=self.context_length).to(self.device)
         with torch.no_grad():
-            pooled, image_embedding = self.model.visual(image_tensor)
-            text_embedding = self.model.encode_text(text_tensor)
+            self.model.visual.trunk.norm.register_forward_hook(self.hook_fn)
+            pooled = self.model.encode_image(image_tensor, normalize=True)
+            # pooled = self.model.visual.trunk(image_tensor)
+            # pooled = self.model.visual.head(pooled)
+            text_embedding = self.model.encode_text(text_tensor, normalize=True)
         pooled = pooled.view(bs, n_patches*n_patches+1, -1)
-        image_embedding = image_embedding.view(bs, n_patches*n_patches+1, image_embedding.shape[-2], image_embedding.shape[-1])
+        image_embedding = self.interm_embeddings.view(bs, n_patches*n_patches+1, self.interm_embeddings.shape[-2], self.interm_embeddings.shape[-1])
         text_embedding = text_embedding.view(bs, caption_length, -1)
         img_embedding, img_out, text_out, pe = self.head(n_patches, pooled, image_embedding, text_embedding)
 
