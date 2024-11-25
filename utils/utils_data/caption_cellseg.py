@@ -63,21 +63,21 @@ class CellAnalyzer:
             base64_unmasked_image = self.encode_pil_image_to_base64(unmasked_image)
 
             # 1. Analyze the full image
-            full_user_request = f"""This is a complete cell imaging image. Please tell me what cell it might be and in which part of the human body. use only percise words in one line, not full sentences. seperate words with only commas."""
+            full_user_request = f"""This is a complete cell imaging image. Please tell me what cell it might be and in which part of the human body. use only percise words in one line."""
             results["caption_all"] = self.call_gpt_api(full_user_request, base64_image)
 
             # 2. Analyze the masked region (cells)
-            masked_user_request = f"""This image only contains cells. Please describe the color, shape, number, and distribution of the cells. use only percise words in one line, not full sentences. seperate words with only commas."""
+            masked_user_request = f"""This image only contains cells. Please describe the color, shape, number, and distribution of the cells. use only percise words in one line."""
             results["caption_cell"] = self.call_gpt_api(masked_user_request, base64_masked_image)
 
             # 3. Analyze the unmasked region (background)
-            unmasked_user_request = f"""This is a slice with masked cells. Please describe the background color and texture. use only percise words in one line, not full sentences.  seperate words with only commas."""
+            unmasked_user_request = f"""This is a slice with masked cells. Please describe the background color and texture. use only percise words in one line."""
             results["caption_bg"] = self.call_gpt_api(unmasked_user_request, base64_unmasked_image)
 
         else:
             # If no mask, only analyze the full image and ask three questions
             # Full image: "What cell might this be and in which part of the body?"
-            full_user_request = f"""This is a complete cell imaging image. Please answer: \n1.what cell it might be and in which part of the human body.\n2.Describe the color, shape, number, and distribution of the cells.\n3.Focus on the background where there is not any cell and describe the background color and texture.\nUse only percise words, not full sentences, no indexes. One line for each answer and make sure there are 3 lines."""
+            full_user_request = f"""This is a complete cell imaging image. Please answer: \n1.what cell it might be and in which part of the human body.\n2.Describe the color, shape, number, and distribution of the cells.\n3.Focus on the background where there is not any cell and describe the background color and texture.\nUse only percise words, no indexes. One line for each answer and make sure there are 3 lines."""
             all_answers = self.call_gpt_api(full_user_request, base64_image).strip().split('\n')
             results["caption_all"] = all_answers[0]
             results['caption_cell'] = all_answers[1]
@@ -124,16 +124,16 @@ class CellAnalyzer:
             return None
 
 def process_image_data(image_path, mask_path, analyzer):
-    img = Image.open(image_path)
-    mask = Image.open(mask_path) if os.path.exists(mask_path) else None
     try:
+        img = Image.open(image_path)
+        mask = Image.open(mask_path) if os.path.exists(mask_path) else None
         analysis_result = analyzer.analyze_cells(img, mask)
     except Exception as e:
         print(f"Error while processing image: {e}")
-        return None
+        analysis_result = {}
     result = {
         'image_path': image_path,
-        'mask_path': mask_path if mask else None,
+        'mask_path': mask_path if os.path.exists(mask_path) else None,
         'analysis_result': analysis_result
     }
     return result
@@ -163,9 +163,9 @@ def chunk_data(data, num_threads):
 
 def main():
     # Set image and mask folder paths
-    image_folder = 'data/Tuning/images'
-    mask_folder = 'data/Tuning/labels'
-    output_file = 'data/annotations/tuning.json'
+    image_folder = 'data/Training-labeled/images'
+    mask_folder = 'data/Training-labeled/labels'
+    output_file = 'data/annotations/training_labeled_detailed.json'
 
     # Initialize the analyzer
     analyzer = CellAnalyzer(openai_api_key="hk-rheyva100004661330ee0aeabe882b1448211555c790a6e9")  # Add actual API key
@@ -178,7 +178,7 @@ def main():
     data = [(image_paths[i], mask_paths[i]) for i in range(len(image_paths))]
 
     # Get number of threads (default is 4)
-    num_threads = 10   # You can adjust this value
+    num_threads = 16   # You can adjust this value
 
     # Create batches based on the number of threads
     batches = chunk_data(data, num_threads)

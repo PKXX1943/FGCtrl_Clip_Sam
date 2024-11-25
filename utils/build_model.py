@@ -46,7 +46,6 @@ def build_model_biomedclip(
             clip_model = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
             tokenizer = 'hf-hub:microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224',
             learnable_pe = True,
-            num_text_embeddings = 1
         ),
         fgctrl_decoder=FGCtrlDecoder(
             fgctrl_config=fgctrl_config,
@@ -84,7 +83,6 @@ def build_model_laion_clip(
             clip_model = 'hf-hub:laion/CLIP-ViT-bigG-14-laion2B-39B-b160k',
             tokenizer = 'hf-hub:laion/CLIP-ViT-bigG-14-laion2B-39B-b160k',
             learnable_pe = True,
-            num_text_embeddings = 1
         ),
         fgctrl_decoder=FGCtrlDecoder(
             fgctrl_config=fgctrl_config,
