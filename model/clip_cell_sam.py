@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Tuple
 from functools import partial
 
 from .clip_encoder import ClipEncoder
-from .fgctrl_decoder import FGCtrlDecoder
+from .decoder import ClipCellDecoder
 from segment_anything.modeling import ImageEncoderViT
 
-class FGCtrlClipSam(nn.Module):
+class ClipCellSam(nn.Module):
     mask_threshold: float = 0.0
     image_format: str = "RGB"
     
@@ -19,14 +19,14 @@ class FGCtrlClipSam(nn.Module):
         self,
         sam_image_encoder: ImageEncoderViT,
         clip_encoder: ClipEncoder,
-        fgctrl_decoder: FGCtrlDecoder,
+        ClipCell_decoder: ClipCellDecoder,
         pixel_mean: List[float] = [123.675, 116.28, 103.53],
         pixel_std: List[float] = [58.395, 57.12, 57.375],
     ):
         super().__init__()
         self.image_encoder = sam_image_encoder
         self.clip_encoder = clip_encoder
-        self.decoder = fgctrl_decoder
+        self.decoder = ClipCell_decoder
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
         
@@ -37,8 +37,8 @@ class FGCtrlClipSam(nn.Module):
     def forward(
         self,
         batched_input : dict,
-        n_patches: int = 4,
-        similarities: bool = True,
+        lamda: float = 0.5,
+        n_patches: int = None,
         multimask_output: bool = False
     ):
         # image_inputs = self.preprocess(batched_input["image"].to(self.device))
@@ -47,17 +47,19 @@ class FGCtrlClipSam(nn.Module):
             image_embedding, interm_embeddings = self.image_encoder(image_inputs)
         pil_images = batched_input["pil_image"]
         captions = batched_input["caption"]
-        clip_embedding, _, text_embedding, clip_pe, sim = self.clip_encoder(
+        clip_embedding, img_token, pos_token, neg_token = self.clip_encoder(
             pil_images, captions, n_patches
         )
-        if not similarities:
-            sim = None
         mask_logits, iou_predictions = self.decoder(
-            image_embedding, interm_embeddings, clip_embedding, clip_pe, text_embedding, sim, multimask_output
+            image_embedding, interm_embeddings, clip_embedding, img_token, pos_token,  multimask_output
         )
-        logits, masks = self.postprocess_masks(
+        mask_bg, _ = self.decoder(
+            image_embedding, interm_embeddings, clip_embedding, img_token, neg_token,  multimask_output
+        )
+        masks = self.postprocess_masks(
                 mask_logits,
-                input_size=mask_logits.shape[-2:],
+                mask_bg,
+                lamda,
                 original_size=batched_input["image"].shape[-2:],
             )
         masks = masks > self.mask_threshold
@@ -65,7 +67,8 @@ class FGCtrlClipSam(nn.Module):
         output = {
             "masks": masks,
             "iou_predictions": iou_predictions,
-            "logits": logits
+            "logits": mask_logits,
+            "bg": mask_bg
         }
         
         return output
@@ -73,8 +76,9 @@ class FGCtrlClipSam(nn.Module):
     # copied from segment_anything/modeling/sam.py
     def postprocess_masks(
         self,
-        masks: torch.Tensor,
-        input_size: Tuple[int, ...],
+        mask_logits: torch.Tensor,
+        mask_bg: torch.Tensor,
+        lamda: float,
         original_size: Tuple[int, ...],
     ) -> torch.Tensor:
         """
@@ -101,11 +105,11 @@ class FGCtrlClipSam(nn.Module):
         # masks = masks[..., : input_size[0], : input_size[1]]
         # mean = masks.mean(dim=(2, 3), keepdim=True)  
         # masks = masks - mean
-
-        masks_ori = F.interpolate(masks, original_size, mode="bilinear", align_corners=False)
+        logits = lamda * mask_bg + (lamda - 1) * mask_logits
+        masks_ori = F.interpolate(logits, original_size, mode="bilinear", align_corners=False)
         # masks = F.relu(masks)
         # masks_ori = F.relu(masks_ori)
-        return masks, masks_ori
+        return masks_ori
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""

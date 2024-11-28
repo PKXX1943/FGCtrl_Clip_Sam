@@ -17,7 +17,7 @@ from validate import val
 torch.autograd.set_detect_anomaly(True)
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('FGCtrl_Clip_Sam', add_help=False)
+    parser = argparse.ArgumentParser('ClipCell_Sam', add_help=False)
 
     parser.add_argument("--output", type=str, required=True, 
                         help="Path to the directory where masks and checkpoints will be output")
@@ -25,8 +25,6 @@ def get_args_parser():
                         help="Dataset: ['Med', 'ADE20K']")
     parser.add_argument("--sam_model_type", type=str, default="vit_l", 
                         help="The type of sam model to load, in ['vit_h', 'vit_l', 'vit_b']")
-    parser.add_argument("--model_type", type=str, default="4patches_256", 
-                        help="The type of model to load, in ['4patches_256']")
     parser.add_argument("--clip", type=str, default="biomed_clip", 
                         help="The type of clip model to load, in ['biomed_clip', 'laion_clip']")
     parser.add_argument("--sam_checkpoint", type=str, required=True, 
@@ -36,7 +34,7 @@ def get_args_parser():
     parser.add_argument("--device", type=str, default="cuda", 
                         help="The device to run generation on.")
 
-    parser.add_argument('--n_patches', default=4, type=int)
+    parser.add_argument('--n_patches', default=None, type=int)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--learning_rate', default=1e-3, type=float)
     parser.add_argument('--start_epoch', default=0, type=int)
@@ -216,6 +214,13 @@ if __name__ == "__main__":
         val_annotations = [
             "prepared/val.txt"
         ]
+    elif args.dataset == 'CellSeg':
+        train_annotations = [
+            "data/annotations/training_labeled_detailed.json"
+        ]
+        val_annotations = [
+            "data/annotations/tuning_detailed.json"
+        ]
     else:
         raise NotImplementedError
     
@@ -226,14 +231,14 @@ if __name__ == "__main__":
         model = build_model_biomedclip(
             sam_model_type=args.sam_model_type,
             sam_checkpoint=args.sam_checkpoint,
-            model_type = args.model_type,
+            # model_type = args.model_type,
             model_checkpoint=args.model_checkpoint
         )
     elif args.clip == 'laion_clip':
         model = build_model_laion_clip(
             sam_model_type=args.sam_model_type,
             sam_checkpoint=args.sam_checkpoint,
-            model_type = args.model_type,
+            # model_type = args.model_type,
             model_checkpoint=args.model_checkpoint
         )
     else:

@@ -1,3 +1,3 @@
 from .clip_encoder import ClipEncoder
-from .fgctrl_decoder import FGCtrlDecoder
-from .fgctrl_clip_sam import FGCtrlClipSam
+from .decoder import ClipCellDecoder
+from .clip_cell_sam import ClipCellSam
