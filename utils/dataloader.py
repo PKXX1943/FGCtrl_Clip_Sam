@@ -53,9 +53,9 @@ def get_data_dict(annotations, shuffle=True, logger=None):
             elif annotation.endswith('.json'):
                 data = json.load(f)
                 dataset_name = annotation.split('/')[-1].split('.')[0]
+                if misc.is_main_process():
+                    print_func(f"----->>> Dataset[{i}]  {dataset_name} <<<---")
                 for item in data:
-                    if misc.is_main_process():
-                        print_func(f"----->>> Dataset[{i}]  {dataset_name} <<<---")
                     tmp_im_list, tmp_gt_list, tmp_caption_list = [], [], []
                     for item in data:
                         tmp_im_list.append(item['image_path'])
